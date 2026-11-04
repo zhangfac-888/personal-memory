@@ -1,0 +1,2 @@
+# Preserve the exact release-manifest bytes on every platform.
+* -text

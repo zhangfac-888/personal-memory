@@ -1,0 +1,12 @@
+{
+  "provider": "openai_compatible",
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-flash",
+  "token_env": "DEEPSEEK_API_KEY",
+  "response_format": "json_object",
+  "thinking": {
+    "type": "disabled"
+  },
+  "timeout_seconds": 60,
+  "audit_responses": false
+}

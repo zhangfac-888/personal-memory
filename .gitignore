@@ -1,0 +1,31 @@
+# Runtime and private data never belong in this repository.
+.venv/
+venv/
+node_modules/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite*
+*.dpapi
+admin-key.txt
+secrets/
+/Data/
+/Runtime/
+logs/
+*.log
+*.jsonl
+automation-outbox/
+injection-audit/
+backups/
+exports/
+installation.json
+share-installation.json
+discovery-status.json
+*pending*.json
+*config.local*
+*.bak
+# Curated frontend/dist and package-manifest.json are intentionally tracked.
