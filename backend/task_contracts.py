@@ -22,6 +22,7 @@ ACTION_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
 CONTRACT_KEYS = {"phase_id", "phase_label", "steps", "allowed_artifacts", "progress_carrier",
                  "forbidden", "checks", "enforce", "notice"}
 CONTRACT_KEYS_V2 = CONTRACT_KEYS | {"execution_mode"}
+CONTRACT_KEYS_V3 = CONTRACT_KEYS_V2 | {"path_roles", "step_actors"}
 STEP_KEYS = {"step_id", "label", "state", "artifact", "marker", "basis"}
 CHECK_KEYS = {"check_id", "command", "cwd", "inputs", "evidence"}
 EVIDENCE_KEYS = {"observed_at", "exit_code", "input_digests", "source", "output_sha256"}
@@ -50,7 +51,7 @@ def _normalized(data):
 
 def validate(data):
     if (not isinstance(data, dict)
-            or (set(data) != CONTRACT_KEYS and set(data) != CONTRACT_KEYS_V2)):
+            or (set(data) != CONTRACT_KEYS and set(data) != CONTRACT_KEYS_V2 and set(data) != CONTRACT_KEYS_V3)):
         raise Problem("VALIDATION_ERROR", "任务约定字段无效", 422)
     data = _normalized(data)
     if data["execution_mode"] not in EXECUTION_MODES:
@@ -61,7 +62,7 @@ def validate(data):
     if data["progress_carrier"] not in CARRIERS or type(data["enforce"]) is not bool:
         raise Problem("VALIDATION_ERROR", "进度载体或执行开关无效", 422)
     arts = data["allowed_artifacts"]
-    if not isinstance(arts, list) or len(arts) > 20 or any(safe_relative(a) != a for a in arts):
+    if not isinstance(arts, list) or len(arts) > 20 or any(not isinstance(a, str) or safe_relative(a) != a for a in arts):
         raise Problem("VALIDATION_ERROR", "允许产物必须是项目内规范相对路径", 422)
     forbidden = data["forbidden"]
     if not isinstance(forbidden, list) or len(forbidden) > 10:
@@ -115,6 +116,18 @@ def validate(data):
             digests = evidence["input_digests"]
             if not isinstance(digests, dict) or set(digests) - set(check["inputs"]) or any(not re.fullmatch(r"[a-f0-9]{64}", str(v)) for v in digests.values()):
                 raise Problem("VALIDATION_ERROR", "检查输入摘要无效", 422)
+    if "path_roles" in data:
+        roles, actors = data["path_roles"], data["step_actors"]
+        if (not isinstance(roles, dict) or set(roles) != set(arts)
+                or any(not isinstance(v, str) or v not in {"existing_input", "future_output"} for v in roles.values())
+                or len({a.casefold() for a in arts}) != len(arts)):
+            raise Problem("VALIDATION_ERROR", "必须明确登记每条产物路径的角色", 422)
+        if not isinstance(actors, dict) or set(actors) != seen:
+            raise Problem("VALIDATION_ERROR", "必须明确登记每个步骤的执行方", 422)
+        order = [actors[s["step_id"]] for s in steps]
+        if (any(not isinstance(actor, str) for actor in order) or set(order) != {"producer", "consumer"}
+                or order != sorted(order, key=lambda x: x != "producer")):
+            raise Problem("VALIDATION_ERROR", "步骤必须先完成 A，再由 B 接手", 422)
     if len(canonical(data)) > 24000:
         raise Problem("VALIDATION_ERROR", "任务约定过长", 422)
     return data
@@ -145,6 +158,8 @@ def set_contract(service, admin, task_id, data, expected_version, reason):
         raise Problem("VALIDATION_ERROR", "版本无效", 422)
     with service.db.tx() as conn:
         task_checkpoints._admin_task(conn, admin, task_id)
+        if conn.execute("SELECT 1 FROM task_preparations WHERE task_id=?", (task_id,)).fetchone() and "path_roles" not in data:
+            raise Problem("VALIDATION_ERROR", "准备任务不可移除路径与步骤执行方约束", 422)
         current = _current(conn, task_id)
         if (current["version"] if current else None) != expected_version:
             raise Problem("VERSION_CONFLICT", "任务约定已被更新，请先读取最新版本", 409)
@@ -214,7 +229,7 @@ def view(contract, origin_root):
         return None
     data = contract["data"]
     step = current_step(data)
-    return {"profile": CONTRACT_PROFILE, "task_id": contract["task_id"], "version": contract["version"],
+    value = {"profile": CONTRACT_PROFILE, "task_id": contract["task_id"], "version": contract["version"],
             "phase_id": data["phase_id"], "phase_label": data["phase_label"], "enforce": data["enforce"],
             "execution_mode": data.get("execution_mode", "scoped_write"),
             "workspace_root": origin_root, "progress_carrier": data["progress_carrier"],
@@ -229,12 +244,16 @@ def view(contract, origin_root):
                             step["label"] if step else "无剩余授权步骤：只读核对，不修改文件、不重跑检查"),
             "checks": [{"check_id": c["check_id"], "command": c["command"], "cwd": c["cwd"], "inputs": c["inputs"],
                         "evidence": c["evidence"]} for c in data["checks"]]}
+    if "path_roles" in data:
+        value.update(profile="task-contract-v3", path_roles=data["path_roles"], step_actors=data["step_actors"])
+    return value
 
 
-def for_client(service, client, task_id):
-    with service.db.read() as conn:
-        client, task = task_checkpoints._row(conn, client, task_id)
-        return view(_current(conn, task_id), task["origin_root"])
+def for_client(service, client, task_id, session_id=None, cwd=None):
+    from . import task_preparations
+    with service.db.readonly() as conn:
+        client, task = task_checkpoints._row(conn, client, task_id, allow_reserved=bool(session_id))
+        return task_preparations.decorate(conn, client, task, view(_current(conn, task_id), task["origin_root"]), session_id, cwd)
 
 
 def render(value):
@@ -252,6 +271,8 @@ def render(value):
             "steps": steps, "observed_checks": [{"id": c["check_id"], "exit_code": c["evidence"]["exit_code"], "observed_at": c["evidence"]["observed_at"]}
                                                  for c in value["checks"] if c["evidence"]][:4],
             "detail_route": "/automation/v2/task-contracts/" + value["task_id"]}
+    if "preparation_state" in value:
+        body.update(preparation_state=value["preparation_state"], actor=value["actor"], blockers=value["preparation_blockers"])
     carrier = ("进度由 PM 任务检查点自动保存，不要另建本地进度文件。" if value["progress_carrier"] == "pm_checkpoint"
                else "进度写入用户指定的允许产物，不要另建其他进度文件。")
     mode = value.get("execution_mode", "scoped_write")
@@ -279,10 +300,16 @@ def render(value):
 
 def _session_task(conn, client, task_id, session_id):
     """The calling session must already be linked to this granted task."""
-    client, task = task_checkpoints._row(conn, client, task_id)
+    client, task = task_checkpoints._row(conn, client, task_id, allow_reserved=True)
+    preparation = conn.execute("SELECT * FROM task_preparations WHERE task_id=?", (task_id,)).fetchone()
+    reserved_producer = (preparation and preparation["state"] == "reserved"
+                         and preparation["producer_client_id"] == client["client_id"]
+                         and preparation["producer_session_id"] == session_id)
+    if preparation and preparation["state"] == "reserved" and not reserved_producer:
+        raise Problem("NOT_FOUND", "任务准备不可用", 404)
     linked = conn.execute("SELECT 1 FROM task_checkpoint_sessions WHERE client_id=? AND session_id=? AND task_id=?",
                           (client["client_id"], session_id, task_id)).fetchone()
-    if not linked:
+    if not linked and not reserved_producer:
         raise Problem("FORBIDDEN", "本会话未关联此任务", 403)
     return client, task
 
@@ -319,10 +346,11 @@ def pre_tool(service, client, task_id, payload):
     """Deterministic decision for one host tool call, recorded before return."""
     from .task_contract_rules import evaluate
     _action_payload(payload)
-    with service.db.read() as conn:
+    from . import task_preparations
+    with service.db.readonly() as conn:
         client, task = _session_task(conn, client, task_id, payload["session_id"])
         contract = _current(conn, task_id)
-    value = view(contract, task["origin_root"])
+        value = task_preparations.decorate(conn, client, task, view(contract, task["origin_root"]), payload["session_id"], payload.get("cwd"))
     digests = payload.get("input_digests")
     if digests is not None and (not isinstance(digests, dict) or any(not isinstance(v, str) for v in digests.values())):
         raise Problem("VALIDATION_ERROR", "输入摘要无效", 422)
@@ -373,7 +401,8 @@ def post_tool(service, client, task_id, payload):
     with service.db.tx(timeout_ms=300) as conn:
         client, task = _session_task(conn, client, task_id, payload["session_id"])
         contract = _current(conn, task_id)
-        value = view(contract, task["origin_root"])
+        from . import task_preparations
+        value = task_preparations.decorate(conn, client, task, view(contract, task["origin_root"]), payload["session_id"], payload.get("cwd"))
         expected_version = payload.get("contract_version")
         version_matches = expected_version is None or (value and value["version"] == expected_version)
         tool = payload["tool_name"].casefold()
@@ -393,7 +422,8 @@ def post_tool(service, client, task_id, payload):
                "exit_code": exit_code, "exit_code_basis": basis, "artifact_json": canonical(artifacts)}
         action_id, created = _record(conn, row)
         promoted = None
-        if created and value and value["current_step"] and version_matches:
+        if (created and value and value["current_step"] and version_matches
+                and ("path_roles" not in value or (value.get("actor_eligible") and not value.get("preparation_blockers")))):
             step = next(s for s in contract["data"]["steps"] if s["step_id"] == value["current_step"])
             targets = file_targets(payload["tool_name"], payload.get("tool_input")) or []
             written = {relative_to(t if re.match(r"^[A-Za-z]:[\\/]|^/", t) else str(payload.get("cwd") or task["origin_root"]) + "/" + t,

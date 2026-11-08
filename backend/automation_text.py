@@ -5,7 +5,7 @@ from .evidence_scope import ANSWER_EVIDENCE_NOTE
 
 SECRET_LINE = re.compile(r"(?im)^.*(?:authorization\s*[:=]|bearer\s+|(?:api[_ -]?key|password|passwd|密码|令牌|secret|access[_-]?token|cookie)\s*[:：=]).*$")
 SECRET_VALUE = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{15,}|eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b|(?<!\d)1[3-9]\d{9}(?!\d)|(?<!\d)\d{17}[\dXx](?!\d)")
-MEMORY_BLOCK = re.compile(r"<(personal_memory_data|personal_conversation_data|personal_memory_coverage)>.*?</\1>", re.S)
+MEMORY_BLOCK = re.compile(r"<(personal_memory_data|personal_conversation_data|personal_memory_coverage|personal_task_status_context)>.*?</\1>", re.S)
 
 
 def clean_text(text):

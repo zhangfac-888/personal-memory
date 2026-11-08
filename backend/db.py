@@ -4,7 +4,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
@@ -122,7 +122,7 @@ class Database:
             now = datetime.now(timezone.utc).isoformat()
             conn.execute("INSERT OR IGNORE INTO schema_migrations VALUES (?,?)", (1, now))
             conn.execute("INSERT OR IGNORE INTO schema_migrations VALUES (?,?)", (3, now))
-            from .migrations import migrate_v4, migrate_v5, migrate_v6, migrate_v7, migrate_v8, migrate_v9, migrate_v10, migrate_v11, migrate_v12, migrate_v13, migrate_v14, migrate_v15
+            from .migrations import migrate_v4, migrate_v5, migrate_v6, migrate_v7, migrate_v8, migrate_v9, migrate_v10, migrate_v11, migrate_v12, migrate_v13, migrate_v14, migrate_v15, migrate_v16
             migrate_v4(conn, now)
             migrate_v5(conn, now)
             migrate_v6(conn, now)
@@ -135,6 +135,7 @@ class Database:
             migrate_v13(conn, now)
             migrate_v14(conn, now)
             migrate_v15(conn, now)
+            migrate_v16(conn, now)
             conn.execute("INSERT OR IGNORE INTO projects(project_id,name,description,created_at,updated_at) VALUES ('global','Global','',?,?)", (now,now))
             conn.execute("INSERT OR IGNORE INTO projects(project_id,name,description,created_at,updated_at) VALUES ('personal-sessions','个人会话','没有可靠项目目录时仍可积累的个人记忆',?,?)", (now,now))
         finally:
@@ -162,6 +163,18 @@ class Database:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    @contextmanager
+    def readonly(self):
+        """SELECT-only connection, without journal initialization or migrations."""
+        conn = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        try:
+            yield conn
         finally:
             conn.close()
 

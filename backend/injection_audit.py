@@ -91,7 +91,8 @@ def retain(config, event, service_result, host_output):
     receipt={"audit_id":ident,"context_sha256":digest(context),"context_chars":len(context),
         "protocol_sha256":digest(protocol),"boundary":"pm_hook_output_before_host_processing"}
     result={key:service_result[key] for key in ("context_text","items","scope","trace_id","task_handoff",
-        "warnings","retrieval_coverage","conversation_references","conversation_search_state") if key in service_result}
+        "warnings","retrieval_coverage","conversation_references","conversation_search_state",
+        "task_status","retrieval_diagnostics") if key in service_result}
     atomic(path,{"schema_version":1,"recorded_at_epoch":timestamp,"expires_at_epoch":timestamp+retention,
         "retention_cleanup":"on next audited read, checked at most hourly; inactive service is not a deletion timer",
         "session_hash":digest(str(event.get("session_id", ""))),"turn_hash":digest(str(event.get("turn_id", ""))),

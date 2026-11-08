@@ -168,6 +168,74 @@ def _artifact_relative(target, cwd, root):
     return relative_to(absolute, root)
 
 
+def physical_path(root, relative, *, role="future_output", directory=False, expected_root_identity=None):
+    """Resolve a declared path inside the physical root; never rebase a bad path.
+
+    Revalidate before each use. This is not a sandbox or an atomic protection
+    against an external process replacing a link after the check.
+    """
+    if safe_relative(relative) != relative or (relative == "." and not directory):
+        raise ValueError("noncanonical_path")
+    parts = PurePosixPath(relative).parts
+    for part in parts:
+        if (part.endswith((".", " ")) or re.search(r'[\x00-\x1f<>:"|?*]', part)
+                or re.fullmatch(r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", part, re.I)):
+            raise ValueError("ambiguous_path")
+    base = Path(root).resolve(strict=True)
+    if not base.is_dir():
+        raise ValueError("root_not_directory")
+    if expected_root_identity is not None:
+        stat = base.stat()
+        identity = {"resolved": norm_path(base), "device": stat.st_dev, "inode": stat.st_ino}
+        if identity != expected_root_identity:
+            raise ValueError("root_identity_changed")
+    target = Path(root) / relative
+    # A dangling link is not an absent future output.
+    current = Path(root)
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            current.resolve(strict=True)
+    resolved = target.resolve(strict=False)
+    if not resolved.is_relative_to(base):
+        raise ValueError("physical_path_escape")
+    if target.exists():
+        if not (resolved.is_dir() if directory else resolved.is_file()):
+            raise ValueError("path_type_mismatch")
+    elif role == "existing_input" or directory:
+        raise ValueError("input_missing")
+    else:
+        ancestor = resolved.parent
+        while not ancestor.exists():
+            ancestor = ancestor.parent
+        if not ancestor.is_dir() or not ancestor.resolve(strict=True).is_relative_to(base):
+            raise ValueError("output_parent_invalid")
+    return resolved
+
+
+def path_checks(contract):
+    """Collect all explicit path failures for prepared contracts only."""
+    if "path_roles" not in contract:
+        return []
+    declarations = [(p, role, False) for p, role in contract["path_roles"].items()]
+    declarations += [(c.get("cwd") or ".", "existing_input", True) for c in contract.get("checks", [])]
+    declarations += [(p, "existing_input", False) for c in contract.get("checks", []) for p in c["inputs"]]
+    results = []
+    for relative, role, directory in declarations:
+        item = {"path": relative, "role": role, "directory": directory, "status": "pass"}
+        try:
+            resolved = physical_path(contract["workspace_root"], relative, role=role, directory=directory, expected_root_identity=contract.get("root_identity"))
+            item["resolved_path"] = str(resolved)
+            item["exists"] = resolved.exists()
+            if resolved.exists() and resolved.is_file():
+                stat = resolved.stat()
+                item["identity"] = [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns]
+        except (OSError, ValueError, RuntimeError) as error:
+            item.update(status="fail", reason=str(error) if isinstance(error, ValueError) else "path_unavailable")
+        results.append(item)
+    return results
+
+
 def artifact_authorized(target, cwd, root, allowed_artifacts):
     """A write target is inside the workspace and exactly listed by the contract."""
     relative = _artifact_relative(target, cwd, root)
@@ -198,6 +266,15 @@ def evaluate(contract, tool_name, tool_input, cwd, *, prompt="", input_digests=N
     root = contract["workspace_root"]
     carrier = contract.get("progress_carrier", "pm_checkpoint")
     allowed = contract.get("allowed_artifacts", [])
+    if "path_roles" in contract and (tool in FILE_TOOLS or tool in SHELL_TOOLS):
+        blockers = contract.get("preparation_blockers", [])
+        if blockers or not contract.get("actor_eligible"):
+            return "deny", "当前会话或准备条件不允许执行此步骤。", {"rule": "preparation_blocked", "blockers": blockers}
+        failures = [p for p in path_checks(contract) if p["status"] == "fail"]
+        if failures:
+            return "deny", "任务路径预检未通过；不要修改文件。", {"rule": "preparation_paths_invalid", "paths": failures}
+        step = next((s for s in contract["steps"] if s["step_id"] == contract.get("current_step")), None)
+        allowed = [step["artifact"]] if step and step["artifact"] else []
     if tool in FILE_TOOLS:
         if mode == "read_only":
             return "deny", ("当前任务处于只读阶段：不得创建、修改、删除或移动任何工作区文件。"
@@ -210,6 +287,12 @@ def evaluate(contract, tool_name, tool_input, cwd, *, prompt="", input_digests=N
             if is_progress_file(absolute, carrier, allowed):
                 return "deny", ("当前任务约定：进度保存在 PM 任务检查点，未授权新建本地进度文件 "
                     + PurePosixPath(norm_path(target)).name + "。本阶段唯一授权交付：" + contract.get("deliverable", "")[:200]), {"rule": "unauthorized_progress_file", "target": target}
+            if "path_roles" in contract:
+                relative = _artifact_relative(target, cwd, root)
+                try:
+                    physical_path(root, relative, role=contract["path_roles"].get(relative, "future_output"), expected_root_identity=contract.get("root_identity"))
+                except (OSError, ValueError, RuntimeError, TypeError):
+                    return "deny", "目标路径不在可确认的工作区内。", {"rule": "physical_path_invalid"}
             if not artifact_authorized(target, cwd, root, allowed):
                 relative = _artifact_relative(target, cwd, root)
                 return "deny", ("当前任务只允许写入明确授权的产物。未授权目标："
@@ -226,6 +309,8 @@ def evaluate(contract, tool_name, tool_input, cwd, *, prompt="", input_digests=N
             command = " ".join(map(str, command))
         if not isinstance(command, str):
             return "not_covered", None, {"rule": "unparsed_shell"}
+        if "path_roles" in contract and not any(matches_check(command, c) for c in contract.get("checks", [])):
+            return "deny", "准备任务只允许已登记的检查命令。", {"rule": "unregistered_prepared_command"}
         shell_writes = SHELL_WRITE.findall(command)
         for match in shell_writes:
             if is_progress_file(match, carrier, allowed):
@@ -275,17 +360,17 @@ def retest_trigger(check, prompt, input_digests):
     return None
 
 
-def digest_inputs(root, paths, limit=8 * 1024 * 1024):
+def digest_inputs(root, paths, limit=8 * 1024 * 1024, expected_root_identity=None):
     """sha256 of registered relative inputs; missing/oversize files are omitted."""
     result = {}
     for rel in paths:
         safe = safe_relative(rel)
         if not safe:
             continue
-        path = Path(root) / safe
         try:
-            if path.is_file() and path.stat().st_size <= limit:
+            path = physical_path(root, safe, role="existing_input", expected_root_identity=expected_root_identity)
+            if path.stat().st_size <= limit:
                 result[safe] = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
+        except (OSError, ValueError, RuntimeError):
             continue
     return result

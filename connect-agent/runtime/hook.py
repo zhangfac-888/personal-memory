@@ -35,6 +35,7 @@ CONTEXT_TAGS = (
     "personal_task_readiness",
     "personal_task_checkpoint",
     "personal_task_contract",
+    "personal_task_status_context",
     "current_result_evidence",
     "personal_memory_data",
     "personal_conversation_data",
@@ -136,7 +137,7 @@ def _short_text(value, limit):
     return value[:room] + "…[截取]" + tail
 
 
-def _compact_json(value, string_limit, list_limit):
+def _compact_json(value, string_limit, list_limit, quote_floor=0):
     """Structurally shorten verbose task data without dropping the envelope."""
     long_keys = {
         "quote", "content", "content_excerpt", "source_excerpt", "phase", "phase_label", "label",
@@ -151,11 +152,14 @@ def _compact_json(value, string_limit, list_limit):
             result = {}
             for key, item in node.items():
                 compacted = walk(item)
-                if (
-                    isinstance(compacted, str)
-                    and len(compacted) > (string_limit if key in long_keys else string_limit * 4)
-                ):
-                    compacted = _short_text(compacted, string_limit)
+                threshold = string_limit if key in long_keys else string_limit * 4
+                if key == "quote" and quote_floor:
+                    # A status answer needs the request/report text, not just
+                    # task IDs. Preserve a useful excerpt even at the tightest
+                    # structural compaction level.
+                    threshold = max(threshold, quote_floor)
+                if isinstance(compacted, str) and len(compacted) > threshold:
+                    compacted = _short_text(compacted, threshold)
                     changed = True
                 result[key] = compacted
             return result
@@ -190,6 +194,7 @@ def _compact_section(section, name, level):
         value,
         string_limit=360 if level == 1 else 180 if level == 2 else 96,
         list_limit=8 if level == 1 else 5 if level == 2 else 3,
+        quote_floor=400 if name == "personal_task_status_context" else 0,
     )
     rendered = _render_structured(name, attrs, _json_body(compacted))
     return rendered, changed
@@ -305,6 +310,7 @@ def bound_context(text):
 
     order = (
         "personal_task_readiness", "personal_task_checkpoint", "personal_task_contract",
+        "personal_task_status_context",
         "current_result_evidence", "personal_memory_data", "personal_conversation_data",
         "personal_memory_coverage", "output_format_contract",
     )
@@ -321,7 +327,7 @@ def bound_context(text):
     compacted_ok = False
     for level in (1, 2, 3):
         for name in ("personal_task_readiness", "personal_task_checkpoint", "personal_task_contract",
-                     "personal_memory_coverage"):
+                     "personal_task_status_context", "personal_memory_coverage"):
             if sections[name]:
                 parts[name], changed = _compact_section(sections[name], name, level)
                 if changed:
@@ -815,9 +821,7 @@ def _is_mutation(tool_name, tool_input):
 
 def _blocked_readiness(pending):
     state = ((pending or {}).get("task_readiness") or {}).get("state")
-    if state in {"grant_missing", "contract_missing", "selection_required", "workspace_mismatch",
-                 "task_conflict", "task_missing", "task_unavailable", "project_mismatch",
-                 "client_unsupported", "read_unavailable", "contract_disabled"}:
+    if state and state not in {"not_applicable", "ready", "checkpoint_ready"}:
         return state
     return None
 
@@ -827,7 +831,7 @@ def _mark_context_unavailable(pending, state, prompt):
         pending["task_readiness"] = {"state": "read_unavailable", "task_id": pending.get("task_id")}
 
 
-def _artifact_metadata(root, cwd, tool_name, tool_input, marker):
+def _artifact_metadata(root, cwd, tool_name, tool_input, marker, root_identity=None):
     files = []
     for target in file_targets(tool_name, tool_input) or []:
         try:
@@ -835,7 +839,8 @@ def _artifact_metadata(root, cwd, tool_name, tool_input, marker):
             relative = relative_to(str(absolute), root)
             if not relative:
                 continue
-            path = Path(root) / relative
+            from backend.task_contract_rules import physical_path
+            path = physical_path(root, relative, role="existing_input", expected_root_identity=root_identity)
             if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
                 continue
             data = path.read_bytes()
@@ -848,7 +853,7 @@ def _artifact_metadata(root, cwd, tool_name, tool_input, marker):
                 "sha256": hashlib.sha256(data).hexdigest(),
                 "contains_marker": bool(marker and marker in text),
             })
-        except (OSError, ValueError):
+        except (OSError, ValueError, RuntimeError):
             continue
     return files
 
@@ -880,11 +885,14 @@ def _tool_hook(config, event, state, path, state_dir, name):
             log_status(state_dir, name, state="task_not_ready")
             return {}
         try:
-            contract_response = get_json(config, "task-contracts/" + task_id)
+            query = urllib.parse.urlencode({"session_id": sid, "cwd": event.get("cwd") or pending.get("cwd") or ""})
+            contract_response = get_json(config, "task-contracts/" + task_id + "?" + query)
             contract = contract_response.get("contract")
             if not contract or contract.get("state") == "unavailable":
                 log_status(state_dir, name, state="contract_missing", task_id=task_id)
                 return _deny("Personal Memory 未找到当前任务合约，不能安全判断本次工具操作；请先配置阶段合约。") if _is_mutation(tool_name, value) else {}
+            if contract.get("preparation_blockers") and (tool_name.casefold() in SHELL_TOOLS or _is_mutation(tool_name, value)):
+                return _deny("Personal Memory 准备条件未满足，不读取检查输入或修改文件。")
             from backend.task_contract_rules import digest_inputs
             inputs = [path for check in contract.get("checks", []) for path in check.get("inputs", [])]
             payload = {
@@ -895,7 +903,7 @@ def _tool_hook(config, event, state, path, state_dir, name):
                 "tool_input": value,
                 "cwd": event.get("cwd") or pending.get("cwd"),
                 "prompt": pending.get("prompt", ""),
-                "input_digests": digest_inputs(contract.get("workspace_root"), inputs),
+                "input_digests": digest_inputs(contract.get("workspace_root"), inputs, expected_root_identity=contract.get("root_identity")),
                 "attempt": event.get("attempt") or 1,
             }
             result = post(config, "task-contracts/" + task_id + "/pre-tool", payload, 1.2)
@@ -907,6 +915,7 @@ def _tool_hook(config, event, state, path, state_dir, name):
                 "tool_input": value,
                 "cwd": payload.get("cwd"),
                 "root": contract.get("workspace_root"),
+                "root_identity": contract.get("root_identity"),
                 "contract_version": result.get("contract_version"),
                 "watch": result.get("watch"),
                 "attempt": payload["attempt"],
@@ -942,7 +951,7 @@ def _tool_hook(config, event, state, path, state_dir, name):
     root = watch.get("root")
     marker = (watch.get("watch") or {}).get("marker")
     artifacts = _artifact_metadata(root, watch.get("cwd"), watch.get("tool_name"),
-                                   watch.get("tool_input"), marker)
+                                   watch.get("tool_input"), marker, watch.get("root_identity"))
     output = None
     if "tool_response" in event:
         output = event.get("tool_response")
@@ -1072,9 +1081,10 @@ def _handle(config, event):
             pending["task_readiness"]={
                 "state": readiness.get("state", "not_applicable"),
                 "task_id": readiness.get("task_id"),
+                "blockers": readiness.get("blockers", []),
             }
-            if library and handoff.get("state")=="attached":
-                pending["task_id"]=handoff["checkpoint"]["task_id"]
+            if library and handoff.get("state") in {"attached", "prepared"}:
+                pending["task_id"] = handoff["checkpoint"]["task_id"] if handoff["state"] == "attached" else handoff["task_id"]
                 state["confirmed_task_id"]=pending["task_id"]
             else:
                 pending.pop("task_id", None)
@@ -1091,6 +1101,10 @@ def _handle(config, event):
                                   matches=len(result["items"]), service_elapsed_ms=result.get("elapsed_ms"),
                                   trace_id=result.get("trace_id"),task_id=pending.get("task_id"),
                                   readiness_state=pending["task_readiness"]["state"],
+                                  task_status_state=(result.get("task_status") or {}).get("state"),
+                                  task_status_candidates=len((result.get("task_status") or {}).get("items", [])),
+                                  task_status_injected=bool(result.get("task_status", {}).get("injected_count")),
+                                  conversation_references=len(result.get("conversation_references", [])),
                                   context_sha256=hashed(result.get("context_text", "")),context_chars=len(result.get("context_text", "")),
                                   context_original_chars=context_compaction["original_chars"],
                                   context_original_utf8_bytes=context_compaction.get("original_utf8_bytes"),

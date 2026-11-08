@@ -380,3 +380,30 @@ def migrate_v15(conn, stamp):
     except BaseException:
         conn.rollback()
         raise
+
+
+def migrate_v16(conn, stamp):
+    """Pre-capture reservations only; no historical progress or grants are filled in."""
+    if (conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] or 0) >= 16:
+        return
+    try:
+        conn.executescript("""BEGIN IMMEDIATE;
+        CREATE TABLE task_preparations(
+          task_id TEXT PRIMARY KEY REFERENCES task_checkpoints(task_id),
+          project_id TEXT NOT NULL REFERENCES projects(project_id),
+          producer_client_id TEXT NOT NULL REFERENCES automation_clients(client_id),
+          producer_session_id TEXT NOT NULL,
+          consumer_client_id TEXT NOT NULL REFERENCES automation_clients(client_id),
+          workspace_root TEXT NOT NULL, root_identity_json TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('reserved','captured','cancelled')),
+          revision INTEGER NOT NULL CHECK(revision>=1),
+          idempotency_key TEXT NOT NULL UNIQUE, definition_hash TEXT NOT NULL,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          UNIQUE(producer_client_id,producer_session_id)
+        );
+        """)
+        conn.execute("INSERT INTO schema_migrations VALUES (16,?)", (stamp,))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise

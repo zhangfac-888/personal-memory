@@ -78,6 +78,40 @@ def search(service, client, query, limit=5, *, exclude_session=None, time_budget
             "part_count": r["part_count"], "match_terms": excerpt(r)[1]} for r in rows]}
 
 
+def recent_session(service, client, session_id, limit=6, max_chars=800):
+    """Recent user/assistant text from this client's own session.
+
+    This is only a query-building view for the current turn. It does not grant
+    archive access, cross-session recall, or any task-association permission.
+    """
+    if (not isinstance(session_id, str) or not session_id or len(session_id) > 160
+            or type(limit) is not int or not 1 <= limit <= 20
+            or type(max_chars) is not int or not 100 <= max_chars <= 4000):
+        raise Problem("VALIDATION_ERROR", "会话近况条件无效", 422)
+    with service.db.read() as conn:
+        client = current_client(conn, {"client_id": client["client_id"]})
+        rows = conn.execute(
+            "SELECT a.archive_id,a.message_id,a.role,a.app,a.captured_at,a.text,a.text_hash "
+            "FROM conversation_parts a WHERE a.client_id=? AND a.session_id=? "
+            "AND a.role IN ('user','assistant') AND a.scope_known=1 AND " + visible_sql() +
+            " ORDER BY a.captured_at DESC,a.rowid DESC LIMIT ?",
+            (client["client_id"], session_id, limit),
+        ).fetchall()
+        items = [{
+            "archive_id": row["archive_id"],
+            "message_id": row["message_id"],
+            "role": row["role"],
+            "source_app": row["app"],
+            "captured_at": row["captured_at"],
+            "text": row["text"][:max_chars],
+            "text_truncated": len(row["text"]) > max_chars,
+            "source_hash": row["text_hash"],
+        } for row in rows]
+    items.reverse()
+    return {"items": items, "limit": limit, "scope": "current_client_current_session",
+            "purpose": "query_basis_only_not_injected_by_itself"}
+
+
 def get(service, client, archive_id, offset=0):
     if not isinstance(archive_id, str) or type(offset) is not int or offset < 0:
         raise Problem("VALIDATION_ERROR", "来源页无效", 422)

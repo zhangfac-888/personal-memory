@@ -8,10 +8,11 @@ import time
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from html import escape
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from mcp_server.tools import make_mcp
@@ -391,9 +392,9 @@ def create_app(data_dir: Path, port: int = 8765, extraction_model=None, automati
         return task_checkpoints.get_checkpoint(service,request.state.automatic_client,task_id,archive_id,offset)
 
     @app.get("/automation/v2/task-contracts/{task_id}")
-    def task_contract_get(task_id:str,request:Request):
+    def task_contract_get(task_id:str,request:Request,session_id:str|None=None,cwd:str|None=None):
         from . import task_contracts
-        return {"contract":task_contracts.for_client(service,request.state.automatic_client,task_id)}
+        return {"contract":task_contracts.for_client(service,request.state.automatic_client,task_id,session_id,cwd)}
 
     @app.post("/automation/v2/task-contracts/{task_id}/pre-tool")
     async def task_contract_pre_tool(task_id:str,request:Request):
@@ -406,6 +407,29 @@ def create_app(data_dir: Path, port: int = 8765, extraction_model=None, automati
         from . import task_contracts
         p=fields(await body(request),{"session_id","turn_id","tool_use_id","tool_name","tool_input","tool_response","exit_code","cwd","artifacts","attempt","contract_version"},{"session_id","tool_use_id","tool_name"})
         return task_contracts.post_tool(service,request.state.automatic_client,task_id,p)
+
+    @app.get("/automation/v2/task-preparation")
+    def task_preparation_get(request:Request,session_id:str,cwd:str):
+        from . import task_preparations
+        return task_preparations.for_session(service,request.state.automatic_client,session_id,cwd) or {"state":"unavailable"}
+
+    @app.post("/api/automation/task-preparations/preview")
+    async def task_preparation_preview(request:Request):
+        from . import task_preparations
+        p=fields(await body(request),{"definition"},{"definition"})
+        return task_preparations.preview(service,admin,p["definition"])
+
+    @app.post("/api/automation/task-preparations")
+    async def task_preparation_commit(request:Request):
+        from . import task_preparations
+        p=fields(await body(request),{"definition","expected","reason"},{"definition","expected","reason"})
+        return task_preparations.commit(service,admin,p["definition"],p["expected"],p["reason"],request.headers.get("Idempotency-Key"))
+
+    @app.post("/api/automation/task-preparations/{task_id}/cancel")
+    async def task_preparation_cancel(task_id:str,request:Request):
+        from . import task_preparations
+        p=fields(await body(request),{"expected_revision","reason"},{"expected_revision","reason"})
+        return task_preparations.cancel(service,admin,task_id,p["expected_revision"],p["reason"])
 
     @app.get("/api/automation/task-contracts/{task_id}")
     def task_contract_history(task_id:str):
@@ -444,6 +468,230 @@ def create_app(data_dir: Path, port: int = 8765, extraction_model=None, automati
     def task_checkpoint_grants():
         with service.db.read() as conn:
             return {"items":[dict(r) for r in conn.execute("SELECT client_id,project_id,allowed,updated_at FROM task_checkpoint_grants ORDER BY project_id,client_id")]}
+
+    @app.get("/admin/relay",response_class=HTMLResponse)
+    def admin_relay(request:Request,project_id:str=""):
+        session=sessions.get(request.cookies.get("pm_session",""))
+        if not session or session["expires"]<time.time():
+            raise Problem("UNAUTHENTICATED","管理会话已失效",401)
+        candidates=[p for p in projects() if p["project_id"] not in {"global","personal-sessions"}]
+        project=next((p for p in candidates if p["project_id"]==project_id),None) if project_id else (candidates[0] if candidates else None)
+        if not project:
+            raise Problem("NOT_FOUND","任务接力项目不存在",404)
+        project_id=project["project_id"]
+        grants={g["client_id"]:g for g in task_checkpoint_grants()["items"] if g["project_id"]==project_id}
+        rows=[]
+        for client in automatic_status()["clients"]:
+            if client["access_mode"]!="library" or client["app"] not in task_checkpoints.APPS:
+                continue
+            cid=escape(client["client_id"],quote=True)
+            grant=grants.get(client["client_id"])
+            allowed=bool(grant and grant["allowed"])
+            available=bool(client["enabled"] and not client["revoked"])
+            client_state="凭据已撤销" if client["revoked"] else "已启用" if client["enabled"] else "已停用"
+            grant_state="已授权" if allowed else "已撤销" if grant else "未授权"
+            authorize_disabled=" disabled" if allowed or not available else ""
+            revoke_disabled=" disabled" if not allowed or not available else ""
+            rows.append(
+                f'<tr data-client-id="{cid}"><td><strong>{escape(client["app"])}</strong>'
+                f'<br><code>{cid}</code><br><small>{client_state}</small></td>'
+                f'<td>{grant_state}</td><td><button type="button" data-allowed="true"{authorize_disabled}>授权</button> '
+                f'<button type="button" data-allowed="false"{revoke_disabled}>撤销</button></td></tr>'
+            )
+        if not rows:
+            rows.append('<tr><td colspan="3">没有可管理的任务接力客户端。</td></tr>')
+        tasks=[]
+        with service.db.read() as conn:
+            for task in conn.execute(
+                    "SELECT c.task_id,c.origin_root,c.created_at,"
+                    "(SELECT MAX(version) FROM task_contracts t WHERE t.task_id=c.task_id) AS version "
+                    "FROM task_checkpoints c WHERE c.project_id=? ORDER BY c.created_at DESC LIMIT 20",
+                    (project_id,)):
+                task=dict(task)
+                data=None
+                if task["version"]:
+                    latest=conn.execute("SELECT data_json FROM task_contracts WHERE task_id=? ORDER BY version DESC LIMIT 1",
+                                        (task["task_id"],)).fetchone()
+                    data=json.loads(latest["data_json"]) if latest else None
+                tasks.append((task,data))
+        blocks=[]
+        for task,data in tasks:
+            tid=escape(task["task_id"],quote=True)
+            version=task["version"] or 0
+            if data and (data.get("path_roles") or data.get("checks") or len(data.get("steps") or [])!=1
+                         or any((s.get("artifact") or s.get("marker") or s.get("basis")) for s in data.get("steps") or [])):
+                blocks.append(
+                    f'<details class="task"><summary><strong>{escape(task["task_id"])}</strong> · 合约 v{version}'
+                    f'<br><small>{escape(task["origin_root"])}（多步骤/检查/路径角色，按原样编辑）</small></summary>'
+                    f'<form data-task="{tid}" data-version="{version}" data-mode="json">'
+                    f'<label>完整合约（JSON）<textarea name="json" rows="16">'
+                    f'{escape(json.dumps(data,ensure_ascii=False,indent=2))}</textarea></label>'
+                    '<p class="form-error" hidden></p><button type="submit">保存合约</button></form></details>'
+                )
+                continue
+            if data:
+                steps=data.get("steps") or [{}]
+                phase_id=data.get("phase_id","")
+                label=steps[0].get("label","")
+                artifacts="\n".join(data.get("allowed_artifacts") or [])
+                forbidden="\n".join(data.get("forbidden") or [])
+                state=f'合约 v{version}'
+            else:
+                phase_id="phase-"+task["task_id"].replace("task_","")[:12]
+                label=""
+                artifacts=""
+                forbidden=""
+                state="<em>尚无合约，这个任务会被拦住</em>"
+            blocks.append(
+                f'<details class="task"><summary><strong>{escape(task["task_id"])}</strong> · {state}'
+                f'<br><small>{escape(task["origin_root"])}</small></summary>'
+                f'<form data-task="{tid}" data-version="{version}" data-mode="simple">'
+                f'<label>阶段编号 <input name="phase_id" value="{escape(phase_id,quote=True)}" size="30"></label>'
+                f'<label>这个任务要做什么 <input name="label" value="{escape(label,quote=True)}" size="80"></label>'
+                f'<label>允许改的文件（每行一个，相对项目根）<textarea name="artifacts" rows="4">'
+                f'{escape(artifacts)}</textarea></label>'
+                f'<label>禁止事项（每行一条）<textarea name="forbidden" rows="3">'
+                f'{escape(forbidden)}</textarea></label>'
+                '<p class="form-error" hidden></p><button type="submit">保存合约</button></form></details>'
+            )
+        task_section=('<h2>任务合约</h2><p>没有合约的任务会被拦截，读得到文件但改不了。'
+                      '这里填「要做什么」和「允许改哪些文件」，保存后立即生效。</p>'
+                      + ("".join(blocks) if blocks else '<p>这个项目还没有任务检查点。</p>'))
+        page=(
+            """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>任务接力授权管理</title>
+"""
+            f'<meta name="relay-project-id" content="{escape(project_id,quote=True)}">\n'
+            f'<meta name="csrf-token" content="{escape(session["csrf"],quote=True)}">\n'
+            """<style>
+body { font-family: system-ui, sans-serif; margin: 32px auto; padding: 0 20px; max-width: 960px; color: #202534; }
+table { width: 100%; border-collapse: collapse; margin-top: 24px; }
+th, td { padding: 14px; border-bottom: 1px solid #dfe3eb; text-align: left; }
+th { background: #f4f6fa; }
+code { overflow-wrap: anywhere; }
+small { color: #596273; }
+button { padding: 7px 14px; cursor: pointer; }
+button:disabled { cursor: default; opacity: .5; }
+#error { color: #b42318; }
+.form-error { color: #b42318; margin: 10px 0 0; }
+details.task { margin: 18px 0; padding: 14px; border: 1px solid #dfe3eb; border-radius: 8px; }
+details.task summary { cursor: pointer; }
+label { display: block; margin: 12px 0; }
+input, textarea { width: 100%; box-sizing: border-box; font-family: inherit; font-size: 14px; padding: 7px; }
+</style>
+</head>
+<body>
+<h1>任务接力授权管理</h1>
+"""
+            f'<p>当前项目：<strong>{escape(project["name"])}</strong><br><code>{escape(project_id)}</code></p>\n'
+            """<p>授权与撤销仅作用于此项目的任务接力权限。</p>
+<p id="error" role="alert" hidden></p>
+<table>
+<thead><tr><th scope="col">客户端</th><th scope="col">接力授权</th><th scope="col">操作</th></tr></thead>
+<tbody>
+"""
+            +"\n".join(rows)+
+            """
+</tbody>
+</table>
+"""+task_section+r"""
+<noscript><p>请启用 JavaScript 后使用授权与撤销按钮。</p></noscript>
+<script>
+const projectId = document.querySelector('meta[name="relay-project-id"]').content;
+const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
+const errorBox = document.getElementById('error');
+let pending = false;
+document.querySelector('tbody').addEventListener('click', async (event) => {
+    const button = event.target.closest('button[data-allowed]');
+    if (!button || button.disabled || pending) return;
+    const clientId = button.closest('tr').dataset.clientId;
+    const enabledButtons = Array.from(document.querySelectorAll('button[data-allowed]:not([disabled])'));
+    pending = true;
+    enabledButtons.forEach((item) => { item.disabled = true; });
+    errorBox.hidden = true;
+    try {
+        const response = await fetch('/api/automation/task-checkpoints/grants', {
+            method: 'PUT',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken },
+            body: JSON.stringify({ client_id: clientId, project_id: projectId, allowed: button.dataset.allowed === 'true' })
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.message || `操作失败（${response.status}）`);
+        window.location.reload();
+    } catch (error) {
+        errorBox.textContent = error.message || '请求失败，请稍后重试。';
+        errorBox.hidden = false;
+    } finally {
+        enabledButtons.forEach((item) => { item.disabled = false; });
+        pending = false;
+    }
+});
+document.addEventListener('submit', async (event) => {
+    const form = event.target.closest('form[data-task]');
+    if (!form || pending) return;
+    event.preventDefault();
+    errorBox.hidden = true;
+    const formError = form.querySelector('.form-error');
+    const showError = (message) => {
+        if (formError) { formError.textContent = message; formError.hidden = false; }
+        errorBox.textContent = message; errorBox.hidden = false;
+    };
+    if (formError) formError.hidden = true;
+    const taskId = form.dataset.task;
+    const version = Number(form.dataset.version) || null;
+    let data;
+    if (form.dataset.mode === 'json') {
+        try { data = JSON.parse(form.elements.json.value); }
+        catch (error) { showError('JSON 格式有误：' + error.message); return; }
+    } else {
+        const lines = (value) => value.split('\n').map((item) => item.trim()).filter(Boolean);
+        const label = form.elements.label.value.trim();
+        const phaseId = (form.elements.phase_id.value.trim() || ('phase-' + taskId.replace(/^task_/, '').slice(0, 12)))
+            .replace(/[^A-Za-z0-9_.-]/g, '-');
+        data = {
+            phase_id: phaseId,
+            phase_label: label,
+            steps: [{ step_id: 'step-1', label: label, state: 'authorized', artifact: null, marker: null, basis: [] }],
+            allowed_artifacts: lines(form.elements.artifacts.value).map((item) => {
+                const path = item.split(String.fromCharCode(92)).join('/');
+                return path.indexOf('./') === 0 ? path.slice(2) : path;
+            }),
+            progress_carrier: 'pm_checkpoint',
+            forbidden: lines(form.elements.forbidden.value),
+            checks: [], enforce: true, notice: '', execution_mode: 'scoped_write'
+        };
+    }
+    const button = form.querySelector('button[type="submit"]');
+    if (button) button.disabled = true;
+    pending = true;
+    try {
+        const response = await fetch('/api/automation/task-contracts/' + encodeURIComponent(taskId), {
+            method: 'PUT',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken },
+            body: JSON.stringify({ data, expected_version: version, reason: '任务接力管理页面保存' })
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.message || result.detail || ('保存失败（' + response.status + '）'));
+        window.location.reload();
+    } catch (error) {
+        showError(error.message || '保存失败，请稍后重试。');
+    } finally {
+        pending = false;
+        if (button) button.disabled = false;
+    }
+});
+</script>
+</body>
+</html>
+"""
+        )
+        return HTMLResponse(page,headers={"Cache-Control":"no-store"})
 
     @app.get("/api/automation/workspace-directory-mappings")
     def workspace_directory_mappings():
@@ -484,6 +732,10 @@ def create_app(data_dir: Path, port: int = 8765, extraction_model=None, automati
 
     @app.get("/api/automation/decisions")
     def automatic_decisions(limit:int=100,project_id:str|None=None):return automatic_review.recent(service,admin,limit,project_id)
+
+    @app.get("/api/automation/retrieval-diagnostics")
+    def automatic_retrieval_diagnostics(limit:int=50):
+        return automation.retrieval_diagnostics(admin,limit)
 
     @app.post("/api/automation/memories/{memory_id}/undo")
     async def undo_automatic_memory(memory_id:str,request:Request):
