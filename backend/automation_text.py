@@ -1,5 +1,6 @@
 """Small, dependency-free filters shared by hooks and the server."""
 import re,json
+from datetime import datetime, timedelta, timezone
 from .source_identity import source_identity_summary, source_identity_note
 from .evidence_scope import ANSWER_EVIDENCE_NOTE
 
@@ -58,21 +59,118 @@ def evidence_context_note(items):
             "来源没有说明的进度、结果和后续安排应直说未知，不补充结论；未提供记录不等于事情不存在，不能写成没有其他进度或没有后续安排。非计划的校验词记录不适用取消状态，不称为未被取消的计划。\n")
 
 
-def retrieval_coverage(items, available=True):
+# A prompt that names a time, a file, a client or asks who did something is a
+# new question, not a continuation of the previous turns. Those anchors must
+# reach the archive search undiluted; "继续"/"那这个呢" still need recent text.
+_ARTIFACT_CUE = re.compile(
+    r"(?<![A-Za-z0-9_.])([A-Za-z0-9_][A-Za-z0-9_\-./\\]*\."
+    r"(?:py|js|mjs|ts|tsx|vue|json|md|sql|ps1|cmd|sh|toml|ya?ml))(?![A-Za-z0-9_])", re.I)
+_DATE_TIME_CUE = re.compile(
+    r"(?<!\d)(?:(\d{4})[-/](\d{1,2})[-/](\d{1,2})|(\d{1,2})[-/月](\d{1,2})[日号]?)"
+    r"(?:\s*(\d{1,2}):(\d{2}))?(?!\d)")
+# Deictic words ("当时"/"上次"/"刚才") point *at* the recent turns and must
+# keep using them; only anchors that recent turns cannot supply count here.
+_PROVENANCE_CUE = re.compile(
+    r"谁改|谁写|谁动|谁做|哪次|什么时候|几点|为什么改|怎么改的?|哪个客户端|"
+    r"来源|出自|昨晚|那天|昨天|前天|今天|今晚", re.I)
+# Only clients the archive actually records; display names are not app values.
+_APP_CUE = {"workbuddy": re.compile(r"(?<![A-Za-z])workbuddy(?![A-Za-z])", re.I),
+            "codex": re.compile(r"(?<![A-Za-z])codex(?![A-Za-z])", re.I),
+            "claude": re.compile(r"(?<![A-Za-z])claude(?:\s+code)?(?![A-Za-z])", re.I)}
+
+
+def _date_cue(text):
+    """Return the first date/time match, or None for ranges like "3-5 条".
+
+    A bare "3-5" is far more often a count than a date; require a four-digit
+    year, an explicit 月/日/号 marker, or a clock time before treating it as one.
+    """
+    for m in _DATE_TIME_CUE.finditer(text):
+        if m.group(1):
+            if 1 <= int(m.group(2)) <= 12 and 1 <= int(m.group(3)) <= 31:
+                return m
+            continue
+        token = m.group(0)
+        if m.group(6) is None and not any(x in token for x in ("月", "日", "号")):
+            continue
+        if 1 <= int(m.group(4)) <= 12 and 1 <= int(m.group(5)) <= 31:
+            return m
+    return None
+
+
+def _time_window(match):
+    """UTC bounds for the archive's captured_at, or None.
+
+    The user speaks in local time and the archive stores UTC, so the anchor is
+    converted rather than compared literally. A clock time gets one hour on
+    each side: the change may be described before or after it happened.
+    """
+    if match is None:
+        return None
+    try:
+        if match.group(1):
+            year = int(match.group(1))
+            month, day = int(match.group(2)), int(match.group(3))
+        else:
+            year = datetime.now().year
+            month, day = int(match.group(4)), int(match.group(5))
+        if match.group(6) is not None:
+            base = datetime(year, month, day, int(match.group(6)), int(match.group(7)))
+            start, end = base - timedelta(minutes=60), base + timedelta(minutes=60)
+        else:
+            start, end = datetime(year, month, day), datetime(year, month, day, 23, 59, 59)
+    except ValueError:
+        return None
+    return (start.astimezone(timezone.utc).isoformat(timespec="seconds"),
+            end.astimezone(timezone.utc).isoformat(timespec="seconds"))
+
+
+def parse_episodic_cues(text):
+    raw = text or ""
+    match = _date_cue(raw)
+    date_cue = match.group(0) if match else ""
+    artifacts = [m.group(1) for m in _ARTIFACT_CUE.finditer(raw)][:3]
+    apps = sorted(name for name, pattern in _APP_CUE.items() if pattern.search(raw))
+    is_provenance = bool(_PROVENANCE_CUE.search(raw))
+    clean = raw
+    if date_cue:
+        clean = (raw[:raw.find(date_cue)] + " " + raw[raw.find(date_cue) + len(date_cue):]).strip()
+    return {"date_cue": date_cue, "time_window": _time_window(match), "artifacts": artifacts,
+            "app_mentions": apps,
+            "is_provenance_query": is_provenance, "fts_clean_query": clean or raw,
+            "has_specific_cue": bool(date_cue or artifacts or apps or is_provenance)}
+
+
+def retrieval_coverage(items, available=True, *, archive_state="not_needed",
+                       archive_found_count=0, archive_query_terms=None):
     # A small authorized retrieval cannot prove that an entire library has
     # been enumerated, even when it happens to return all known test rows.
-    return {"exhaustive":False,"provided_memory_count":len(items),
+    coverage = {"exhaustive":False,"provided_memory_count":len(items),
             "memory_limit":5,"availability":"available" if available else "unavailable"}
+    # Whether the archive was searched at all is a fact about this turn, not a
+    # confidence score: "searched and found nothing" must not look like "never
+    # looked". Only the state is reported, never unauthorized archive text.
+    if archive_state != "not_needed" or archive_found_count:
+        coverage["conversation_archive_state"] = archive_state
+        coverage["conversation_archive_found_count"] = int(archive_found_count)
+    if archive_state.startswith("searched") and archive_query_terms:
+        coverage["conversation_archive_query_terms"] = list(archive_query_terms)[:8]
+    return coverage
 
 def retrieval_coverage_context(coverage):
     data=json.dumps(coverage,ensure_ascii=False,separators=(",",":"))
+    state=coverage.get("conversation_archive_state","")
+    archive_note={"searched_0":"本轮已按授权范围检索过历史会话归档，没有可用的命中；这不证明没有记录。\n",
+                  "not_granted":"本轮没有读取历史会话归档的权限，因此没有检索；不能据此断言没有记录。\n",
+                  "read_unavailable":"本轮尝试检索历史会话归档但读取失败，没有得到结果。\n"}.get(state,"")
     return ("\n以下是本轮记忆检索的覆盖范围，不是全库清单。exhaustive=false表示只提供有限检索结果，"
             "也可能因权限、相关性、状态或篇幅限制遗漏记录；零条结果或读取不可用都不证明不存在。"
             "只说明本轮提供的记录中找到了什么；没有另行取得明确的全量覆盖证据时，"
             "不要断言仅剩、只有这些、没有其他记录或全部事项已完成，也不要假称已遍历全库。"
             "需要穷尽清单时应说明当前证据不足。不要向用户复述内部字段名、XML或JSON，"
             "用普通语言说明本轮提供的记录可能不全。\n"
-            "<personal_memory_coverage>"+data+"</personal_memory_coverage>")
+            + archive_note
+            + "<personal_memory_coverage>"+data+"</personal_memory_coverage>")
 
 
 # This is a conservative extraction view, not the durable conversation archive.
