@@ -32,16 +32,30 @@ def _gate(conn, client):
     return sql + " AND " + visible_sql(), [canonical(projects), canonical(roots)]
 
 
-def search(service, client, query, limit=5, *, exclude_session=None, time_budget_ms=None, significant_only=False, project_ids=None):
+def _query_terms(query, significant_only):
+    terms = [x for x in dict.fromkeys(tokenize(query)) if x not in QUERY_STOPWORDS][:20]
+    if significant_only:
+        generic = {"项目", "工作", "问题", "什么", "如何", "这个", "之前", "历史", "会话", "消息", "请问", "记录", "内容", "结果", "用户", "我们"}
+        terms = [x for x in terms if len(x) >= 2 and x not in generic]
+    # "11-07 20:48" tokenizes into bare numbers that match unrelated text and
+    # outrank the actual subject. A timestamp is a coordinate for the archive,
+    # not a word in it, so drop numeric-only terms whenever the query also
+    # names something. A query that is only numbers keeps them.
+    if any(not term.isdigit() for term in terms):
+        terms = [term for term in terms if not term.isdigit()]
+    return terms
+
+
+def search(service, client, query, limit=5, *, exclude_session=None, time_budget_ms=None, significant_only=False, project_ids=None, time_window=None):
     if not isinstance(query, str) or len(query) > 2000 or type(limit) is not int or not 1 <= limit <= 50:
         raise Problem("VALIDATION_ERROR", "检索条件无效", 422)
     if project_ids is not None and (not isinstance(project_ids, list) or not 1 <= len(project_ids) <= 20
             or any(not isinstance(pid, str) or not 1 <= len(pid) <= 160 for pid in project_ids)):
         raise Problem("VALIDATION_ERROR", "会话项目范围无效", 422)
-    terms = [x for x in dict.fromkeys(tokenize(query)) if x not in QUERY_STOPWORDS][:20]
-    if significant_only:
-        generic = {"项目", "工作", "问题", "什么", "如何", "这个", "之前", "历史", "会话", "消息", "请问", "记录", "内容", "结果", "用户", "我们"}
-        terms = [x for x in terms if len(x) >= 2 and x not in generic]
+    if time_window is not None and (not isinstance(time_window, (list, tuple)) or len(time_window) != 2
+            or any(not isinstance(x, str) or not x for x in time_window)):
+        raise Problem("VALIDATION_ERROR", "会话时间范围无效", 422)
+    terms = _query_terms(query, significant_only)
     with service.db.read() as conn:
         gate, args = _gate(conn, client)
         # Intersect with the authorization gate before ranking and LIMIT.
@@ -59,11 +73,19 @@ def search(service, client, query, limit=5, *, exclude_session=None, time_budget
         if exclude_session:
             gate += " AND a.session_id!=?"
             args.append(exclude_session)
+        # A time anchor is a coordinate, not a word: parts captured inside the
+        # window sort first, and everything else keeps its normal rank. The
+        # predicate stays inside the same authorization gate.
+        window_order, window_args = "", []
+        if time_window:
+            window_order = "CASE WHEN a.captured_at BETWEEN ? AND ? THEN 0 ELSE 1 END, "
+            window_args = [time_window[0], time_window[1]]
         rows = conn.execute(
             "SELECT a.*,p.name project_name,bm25(conversation_fts) rank FROM conversation_fts "
             "JOIN conversation_parts a ON a.archive_id=conversation_fts.archive_id "
             "JOIN projects p ON p.project_id=a.project_id WHERE conversation_fts MATCH ? AND " + gate +
-            " ORDER BY rank,a.captured_at DESC,a.archive_id LIMIT ?", [expression, *args, limit]).fetchall()
+            " ORDER BY " + window_order + "rank,a.captured_at DESC,a.archive_id LIMIT ?",
+            [expression, *args, *window_args, limit]).fetchall()
         def excerpt(row):
             text = row["text"]
             matches = [term for term in terms if term in text.lower()]
