@@ -1,6 +1,6 @@
 {
   "format_version": 1,
-  "snapshot": "windows-x64-preview-20261109",
+  "snapshot": "windows-x64-preview-20261110",
   "schema_version": 16,
   "files": {
     ".gitattributes": "fd534920426b4e86d18e815d36b5bd9f768f07756041af0c03357871543a4351",
@@ -16,11 +16,11 @@
     "backend/__main__.py": "048a2a390c67cc9b9372128fa54fead907c8b541da70ef62a751fab29f5a4266",
     "backend/api.py": "f970d7044af4448e19eecee4db230c999507d357622c9327aaea3cc476be1199",
     "backend/automatic_review.py": "988cd5a03f169beb73bd7ed180a0bdf1d1488b355c828dc8973ecf8de58aec28",
-    "backend/automation.py": "ff22ef2cd229856ad6a658e95b63946bc9e4bb64962b60c44355b68949c97a06",
+    "backend/automation.py": "f640c24b114661e4e1a7e86fc5a18b0dbd15d71d6976da328ad6e499ecfb0f83",
     "backend/automation_provider.py": "ca5ec8a4e1cf6489d03c2b18b11202edee51a0db1bbf5d8319c9bb51dd60cacf",
-    "backend/automation_text.py": "43e5dc91c47f946572044f16eefc02c63f602254ae7355854e6eff96594c2b8a",
+    "backend/automation_text.py": "62de35d7c6422fc6a80c1882405a3c432e2dfd97f8ffb7ad982e72deb8385907",
     "backend/claude_source.py": "0037027e51ecc6628cc43a5bff4bd0dcd343bb524a54cb72bc26cd55aa1cb977",
-    "backend/conversation_archive.py": "b08c56edb444b8f5e057093934a06f39bef6c8b3195c3c3b4575b89c9a0ad14d",
+    "backend/conversation_archive.py": "855978604606b6e3170cdb9e0468b8185546bcc5ee3e521d6e8df3561af1be4c",
     "backend/conversation_provenance.py": "ca832ba958be1b124021bd6ea70736336f6d6c7ccceee2ede00d7263c760ffc0",
     "backend/credentials.py": "9a7c0c5d50054d5fb7bfccb6f646644c9ea749f2998ae41071d64d46634f2d72",
     "backend/db.py": "9f5695c524d0e0bdacba535deaf828e29fd7f17b791761cf4c864f0dbd863e0d",

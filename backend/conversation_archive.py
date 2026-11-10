@@ -32,17 +32,20 @@ def _gate(conn, client):
     return sql + " AND " + visible_sql(), [canonical(projects), canonical(roots)]
 
 
-def _query_terms(query, significant_only):
-    terms = [x for x in dict.fromkeys(tokenize(query)) if x not in QUERY_STOPWORDS][:20]
+def _query_terms(query, significant_only, *, strip_dates=True):
+    # "11-07 20:48" is a coordinate, not a word: its bare calendar numbers
+    # match unrelated text and outrank the subject. Strip the literal before
+    # tokenizing, so domain numbers ("Schema 16", "422", "8765") survive.
+    # The regex lives in automation_text; a lazy import keeps module loading
+    # acyclic and gives both modules one definition instead of two.
+    source = query or ""
+    if strip_dates:
+        from .automation_text import _DATE_TIME_CUE
+        source = _DATE_TIME_CUE.sub(" ", source)
+    terms = [x for x in dict.fromkeys(tokenize(source)) if x not in QUERY_STOPWORDS][:20]
     if significant_only:
         generic = {"项目", "工作", "问题", "什么", "如何", "这个", "之前", "历史", "会话", "消息", "请问", "记录", "内容", "结果", "用户", "我们"}
-        terms = [x for x in terms if len(x) >= 2 and x not in generic]
-    # "11-07 20:48" tokenizes into bare numbers that match unrelated text and
-    # outrank the actual subject. A timestamp is a coordinate for the archive,
-    # not a word in it, so drop numeric-only terms whenever the query also
-    # names something. A query that is only numbers keeps them.
-    if any(not term.isdigit() for term in terms):
-        terms = [term for term in terms if not term.isdigit()]
+        terms = [x for x in terms if (len(x) >= 2 or x.isdigit()) and x not in generic]
     return terms
 
 
@@ -53,23 +56,27 @@ def search(service, client, query, limit=5, *, exclude_session=None, time_budget
             or any(not isinstance(pid, str) or not 1 <= len(pid) <= 160 for pid in project_ids)):
         raise Problem("VALIDATION_ERROR", "会话项目范围无效", 422)
     if time_window is not None and (not isinstance(time_window, (list, tuple)) or len(time_window) != 2
-            or any(not isinstance(x, str) or not x for x in time_window)):
+            or any(not isinstance(x, str) or not x for x in time_window)
+            or time_window[0] > time_window[1]):
         raise Problem("VALIDATION_ERROR", "会话时间范围无效", 422)
     terms = _query_terms(query, significant_only)
+    if not terms and not time_window:
+        # Without a window, a query that is only a date still has to search
+        # literally; stripping it would turn a lookup into an empty result.
+        terms = _query_terms(query, significant_only, strip_dates=False)
     with service.db.read() as conn:
         gate, args = _gate(conn, client)
         # Intersect with the authorization gate before ranking and LIMIT.
         if project_ids is not None:
             gate += " AND a.project_id IN (SELECT value FROM json_each(?))"
             args.append(canonical(list(dict.fromkeys(project_ids))))
-        if not terms:
+        if not terms and not time_window:
             return {"items": [], "query_terms": []}
         if time_budget_ms is not None:
             import time
             conn.execute("PRAGMA busy_timeout=100")
             deadline = time.monotonic() + time_budget_ms / 1000
             conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
-        expression = " OR ".join('"' + x.replace('"', '""') + '"' for x in terms)
         if exclude_session:
             gate += " AND a.session_id!=?"
             args.append(exclude_session)
@@ -80,19 +87,36 @@ def search(service, client, query, limit=5, *, exclude_session=None, time_budget
         if time_window:
             window_order = "CASE WHEN a.captured_at BETWEEN ? AND ? THEN 0 ELSE 1 END, "
             window_args = [time_window[0], time_window[1]]
-        rows = conn.execute(
-            "SELECT a.*,p.name project_name,bm25(conversation_fts) rank FROM conversation_fts "
-            "JOIN conversation_parts a ON a.archive_id=conversation_fts.archive_id "
-            "JOIN projects p ON p.project_id=a.project_id WHERE conversation_fts MATCH ? AND " + gate +
-            " ORDER BY " + window_order + "rank,a.captured_at DESC,a.archive_id LIMIT ?",
-            [expression, *args, *window_args, limit]).fetchall()
+        rows, basis = [], "fts"
+        if terms:
+            expression = " OR ".join('"' + x.replace('"', '""') + '"' for x in terms)
+            rows = conn.execute(
+                "SELECT a.*,p.name project_name,bm25(conversation_fts) rank FROM conversation_fts "
+                "JOIN conversation_parts a ON a.archive_id=conversation_fts.archive_id "
+                "JOIN projects p ON p.project_id=a.project_id WHERE conversation_fts MATCH ? AND " + gate +
+                " ORDER BY " + window_order + "rank,a.captured_at DESC,a.archive_id LIMIT ?",
+                [expression, *args, *window_args, limit]).fetchall()
+        if not rows and time_window:
+            # The question may carry only a time coordinate ("那会儿在弄啥?"),
+            # or use wording the transcript never used. The window is still a
+            # deterministic, already-authorized way to reach that moment, so
+            # read the parts inside it directly -- same gate, same limit. They
+            # carry no keyword match; the caller must accept that explicitly.
+            rows = conn.execute(
+                "SELECT a.*,p.name project_name,0.0 AS rank FROM conversation_parts a "
+                "JOIN projects p ON p.project_id=a.project_id WHERE " + gate +
+                " AND a.captured_at BETWEEN ? AND ? "
+                "ORDER BY a.captured_at DESC,a.archive_id LIMIT ?",
+                [*args, time_window[0], time_window[1], limit]).fetchall()
+            basis = "time_window"
         def excerpt(row):
             text = row["text"]
             matches = [term for term in terms if term in text.lower()]
             positions = [text.lower().find(term) for term in matches]
             start = max(0, min(positions) - 100) if positions else 0
             return text[start:start + 600], matches
-        return {"query_terms": terms, "items": [{"kind": "conversation_reference", "archive_id": r["archive_id"],
+        return {"query_terms": terms, "items": [{"kind": "conversation_reference", "retrieval_basis": basis,
+            "archive_id": r["archive_id"],
             "session_id": r["session_id"], "message_id": r["message_id"], "role": r["role"],
             "source_app": r["app"], "source_client_id": r["client_id"], "project_id": r["project_id"], "project_name": r["project_name"],
             "captured_at": r["captured_at"], "excerpt": excerpt(r)[0], "source_hash": r["text_hash"],

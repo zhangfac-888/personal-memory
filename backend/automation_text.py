@@ -66,12 +66,12 @@ _ARTIFACT_CUE = re.compile(
     r"(?<![A-Za-z0-9_.])([A-Za-z0-9_][A-Za-z0-9_\-./\\]*\."
     r"(?:py|js|mjs|ts|tsx|vue|json|md|sql|ps1|cmd|sh|toml|ya?ml))(?![A-Za-z0-9_])", re.I)
 _DATE_TIME_CUE = re.compile(
-    r"(?<!\d)(?:(\d{4})[-/](\d{1,2})[-/](\d{1,2})|(\d{1,2})[-/月](\d{1,2})[日号]?)"
-    r"(?:\s*(\d{1,2}):(\d{2}))?(?!\d)")
+    r"(?<!\d)(?:(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})[日号]?|(\d{1,2})[-/月](\d{1,2})[日号]?)"
+    r"(?:\s*(\d{1,2}):(\d{2})(?::\d{2})?)?(?!\d)")
 # Deictic words ("当时"/"上次"/"刚才") point *at* the recent turns and must
 # keep using them; only anchors that recent turns cannot supply count here.
 _PROVENANCE_CUE = re.compile(
-    r"谁改|谁写|谁动|谁做|哪次|什么时候|几点|为什么改|怎么改的?|哪个客户端|"
+    r"谁[在来]?(?:改|写|动|做)|哪次|什么时候|几点|为什么改|怎么改的?|哪个客户端|"
     r"来源|出自|昨晚|那天|昨天|前天|今天|今晚", re.I)
 # Only clients the archive actually records; display names are not app values.
 _APP_CUE = {"workbuddy": re.compile(r"(?<![A-Za-z])workbuddy(?![A-Za-z])", re.I),
@@ -83,17 +83,25 @@ def _date_cue(text):
     """Return the first date/time match, or None for ranges like "3-5 条".
 
     A bare "3-5" is far more often a count than a date; require a four-digit
-    year, an explicit 月/日/号 marker, or a clock time before treating it as one.
+    year, an explicit 月/日/号 marker, a clock time, or a zero-padded MM-DD
+    before treating it as one.
     """
     for m in _DATE_TIME_CUE.finditer(text):
         if m.group(1):
             if 1 <= int(m.group(2)) <= 12 and 1 <= int(m.group(3)) <= 31:
                 return m
             continue
-        token = m.group(0)
-        if m.group(6) is None and not any(x in token for x in ("月", "日", "号")):
+        month, day = m.group(4), m.group(5)
+        if not (1 <= int(month) <= 12 and 1 <= int(day) <= 31):
             continue
-        if 1 <= int(m.group(4)) <= 12 and 1 <= int(m.group(5)) <= 31:
+        token = m.group(0)
+        if m.group(6) is not None or any(x in token for x in ("月", "日", "号")):
+            return m
+        # A bare MM-DD is far more often a range ("10-20 分钟") than a date.
+        # Only a zero-padded pair stands on its own; anything else needs the
+        # clock or the Chinese markers above. This keeps "11-07" usable
+        # without turning every two-number range into a day.
+        if len(month) == 2 and len(day) == 2 and (month.startswith("0") or day.startswith("0")):
             return m
     return None
 
@@ -138,7 +146,10 @@ def parse_episodic_cues(text):
     return {"date_cue": date_cue, "time_window": _time_window(match), "artifacts": artifacts,
             "app_mentions": apps,
             "is_provenance_query": is_provenance, "fts_clean_query": clean or raw,
-            "has_specific_cue": bool(date_cue or artifacts or apps or is_provenance)}
+            # A provenance question alone ("这是谁在改") carries no anchor: "这"
+            # points at the recent turns, so dropping them leaves nothing to
+            # search for. Only a time, a file or a client is self-sufficient.
+            "has_specific_cue": bool(date_cue or artifacts or apps)}
 
 
 def retrieval_coverage(items, available=True, *, archive_state="not_needed",

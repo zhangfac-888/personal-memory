@@ -690,14 +690,29 @@ class AutomationService:
         sit minutes apart, and a time window would attach one turn's request to
         another turn's action. Every neighbour read stays inside the same
         archive gate as the search that produced the match.
+
+        One turn can still be only "好，改吧", with the instruction in the turn
+        before it. Only in that case, and only when the text is an exact
+        confirmation, the card walks back one user part in the same session and
+        labels it as the cause, keeping the confirmation as its own line.
         """
+        confirmations = frozenset({
+            "好", "好的", "好滴", "可以", "行", "嗯", "继续", "开始", "开始吧",
+            "改吧", "确认", "同意", "没问题", "是的", "对", "ok", "okay", "yes",
+            "好的改吧", "好的，改吧", "好改吧", "可以改吧", "确认修改", "继续吧", "go ahead",
+        })
+
         def clip(value, limit):
             return " ".join((value or "").split())[:limit]
+
+        def confirmation(value):
+            cleaned = " ".join((value or "").split()).strip().rstrip("。！!.,，、~～")
+            return cleaned.casefold() in confirmations
 
         with self.db.read() as conn:
             gate, args = conversation_archive._gate(conn, {"client_id": client["client_id"]})
             head = conn.execute(
-                "SELECT a.original_turn_id,a.client_id,a.session_id FROM conversation_parts a "
+                "SELECT a.rowid AS rid,a.original_turn_id,a.client_id,a.session_id FROM conversation_parts a "
                 "JOIN projects p ON p.project_id=a.project_id WHERE a.archive_id=? AND " + gate,
                 [ref["archive_id"], *args]).fetchone()
             if not head:
@@ -709,7 +724,7 @@ class AutomationService:
                 # report no key rather than grouping unrelated parts together.
                 return ref["excerpt"], None
             key = (head["client_id"], head["session_id"], turn)
-            base = ("SELECT a.archive_id,a.role,a.app,a.text FROM conversation_parts a "
+            base = ("SELECT a.rowid AS rid,a.archive_id,a.role,a.app,a.text FROM conversation_parts a "
                     "JOIN projects p ON p.project_id=a.project_id WHERE " + gate +
                     " AND a.client_id=? AND a.session_id=? AND a.original_turn_id=?")
             ident = [*args, head["client_id"], head["session_id"], turn]
@@ -717,12 +732,30 @@ class AutomationService:
                                    ident).fetchone()
             conclusion = conn.execute(base + " AND a.role='assistant' ORDER BY a.part_index DESC,a.rowid DESC LIMIT 1",
                                       ident).fetchone()
+            prior = None
+            if request is not None and confirmation(request["text"]):
+                # rowid is insertion order, which is capture order here. Reach
+                # only one user part back, inside the same gate and session: a
+                # wider walk would attach an unrelated instruction as the cause.
+                prior = conn.execute(
+                    "SELECT a.archive_id,a.app,a.text FROM conversation_parts a "
+                    "JOIN projects p ON p.project_id=a.project_id WHERE " + gate +
+                    " AND a.client_id=? AND a.session_id=? AND a.role='user' AND a.rowid < ? "
+                    " AND length(trim(a.text)) >= 8 ORDER BY a.rowid DESC LIMIT 1",
+                    [*args, head["client_id"], head["session_id"], request["rid"]]).fetchone()
         parts = []
-        if request and request["archive_id"] != ref["archive_id"]:
-            parts.append("【起因·%s】%s" % (request["app"], clip(request["text"], 180)))
-        parts.append("【命中·%s】%s" % (ref["role"], clip(ref["excerpt"], 240)))
+        if request and request["archive_id"] == ref["archive_id"]:
+            # The hit is the user's own instruction; it is the cause itself.
+            parts.append("【起因·%s】%s" % (request["app"], clip(ref["excerpt"], 205)))
+        else:
+            cause = prior or request
+            if cause:
+                parts.append("【起因·%s】%s" % (cause["app"], clip(cause["text"], 160)))
+            if prior and request:
+                parts.append("【确认·%s】%s" % (request["app"], clip(request["text"], 35)))
+            parts.append("【命中·%s】%s" % (ref["role"], clip(ref["excerpt"], 205)))
         if conclusion and conclusion["archive_id"] != ref["archive_id"]:
-            parts.append("【结果·%s】%s" % (conclusion["app"], clip(conclusion["text"], 180)))
+            parts.append("【结果·%s】%s" % (conclusion["app"], clip(conclusion["text"], 140)))
         return "\n".join(parts)[:limit_chars], key
 
     def context(self, client, request):
@@ -1096,8 +1129,13 @@ class AutomationService:
         status_intent = task_checkpoints.is_status_query(request.prompt)
         status_apps = task_checkpoints.mentioned_apps(request.prompt)
         conversation_projects = [scope["project_id"]] if status_intent else project_ids
+        # Topical memories describe what the work is, not who performed it.
+        # "这是谁在改" is answered only by the archive, so a provenance question
+        # that has a referent keeps the gate open; other questions still stop
+        # once two relevant memories were retained.
+        topical_sufficient = len(topical) >= 2 and not prompt_cues["is_provenance_query"]
         if (archive_state != "not_granted" and not pending_plan
-                and len(topical) < 2 and len(retrieval_query.strip()) >= 6 and remaining > 0):
+                and not topical_sufficient and len(retrieval_query.strip()) >= 6 and remaining > 0):
             stage = time.monotonic()
             try:
                 found_conversations = conversation_archive.search(self.service, client, retrieval_query, 24,
@@ -1119,7 +1157,12 @@ class AutomationService:
                 required_matches = min(2, len(found_conversations["query_terms"]))
                 seen_turns = set()
                 for ref in candidates:
-                    if len(ref["match_terms"]) < required_matches or not required_matches:
+                    # A row read straight from the time window shares no term
+                    # with the question by construction; the window, not a
+                    # keyword, is what selected it. Keyword hits still have to
+                    # overlap, so a weak FTS match cannot ride in on nothing.
+                    if (ref.get("retrieval_basis") != "time_window"
+                            and len(ref["match_terms"]) < required_matches):
                         continue
                     try:
                         card, turn_key = self._archive_turn_card(client, ref)
@@ -1148,7 +1191,7 @@ class AutomationService:
             blocked = []
             if pending_plan:
                 blocked.append("pending_plan_query")
-            if len(topical) >= 2:
+            if topical_sufficient:
                 blocked.append("topical_sufficient")
             if len(retrieval_query.strip()) < 6:
                 blocked.append("query_too_short")
@@ -1247,6 +1290,9 @@ class AutomationService:
                 "recent_session_message_ids": [item["message_id"] for item in recent_session["items"]],
                 "current_prompt_sha256": digest(request.prompt),
                 "archive_query_basis": "prompt_only" if prompt_cues["has_specific_cue"] else "prompt_plus_recent",
+                # Length is what the "< 6 characters" gate actually sees; the
+                # prompt alone can be far shorter than the joined query.
+                "retrieval_query_chars": len(retrieval_query.strip()),
                 "prompt_cues": prompt_cues,
             },
             "conversation_search": {
@@ -1302,8 +1348,12 @@ class AutomationService:
         }
         # Keep the record whenever the archive was actually attempted, so a
         # later "why didn't you find it" can be answered from evidence instead
-        # of reconstructed from memory of the conversation.
-        if status_intent or injected_task_ids or archive_state != "not_needed":
+        # of reconstructed from memory of the conversation. A provenance
+        # question that never searched is recorded too: "who changed this"
+        # leaving no trace at all is exactly the case that made the earlier
+        # rounds guess at which gate stopped it.
+        if (status_intent or injected_task_ids or archive_state != "not_needed"
+                or prompt_cues["is_provenance_query"]):
             self._record_retrieval_diagnostic(client, request, diagnostics)
         route_parts = []
         if items:
