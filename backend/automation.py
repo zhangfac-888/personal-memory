@@ -706,8 +706,12 @@ class AutomationService:
             return " ".join((value or "").split())[:limit]
 
         def confirmation(value):
-            cleaned = " ".join((value or "").split()).strip().rstrip("。！!.,，、~～")
-            return cleaned.casefold() in confirmations
+            cleaned = " ".join((value or "").split()).strip().rstrip("。！!.,，、~～；;")
+            # "可以，改吧。" keeps its comma after the terminal punctuation is
+            # stripped; compare a comma-free form so the same words still count
+            # as a confirmation of the instruction in the turn before them.
+            compact = cleaned.replace("，", "").replace(",", "")
+            return cleaned.casefold() in confirmations or compact.casefold() in confirmations
 
         with self.db.read() as conn:
             gate, args = conversation_archive._gate(conn, {"client_id": client["client_id"]})

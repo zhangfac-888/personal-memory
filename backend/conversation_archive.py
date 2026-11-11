@@ -87,7 +87,7 @@ def search(service, client, query, limit=5, *, exclude_session=None, time_budget
         if time_window:
             window_order = "CASE WHEN a.captured_at BETWEEN ? AND ? THEN 0 ELSE 1 END, "
             window_args = [time_window[0], time_window[1]]
-        rows, basis = [], "fts"
+        rows = []
         if terms:
             expression = " OR ".join('"' + x.replace('"', '""') + '"' for x in terms)
             rows = conn.execute(
@@ -96,26 +96,33 @@ def search(service, client, query, limit=5, *, exclude_session=None, time_budget
                 "JOIN projects p ON p.project_id=a.project_id WHERE conversation_fts MATCH ? AND " + gate +
                 " ORDER BY " + window_order + "rank,a.captured_at DESC,a.archive_id LIMIT ?",
                 [expression, *args, *window_args, limit]).fetchall()
-        if not rows and time_window:
+        # The fallback trigger is "nothing inside the window", not "no rows at
+        # all": a keyword hit from another day must not silence the moment the
+        # question anchored. Window rows come first; the outside keyword hits
+        # keep their place after them instead of being dropped.
+        window_ids = set()
+        if time_window and not any(time_window[0] <= r["captured_at"] <= time_window[1] for r in rows):
             # The question may carry only a time coordinate ("那会儿在弄啥?"),
             # or use wording the transcript never used. The window is still a
             # deterministic, already-authorized way to reach that moment, so
             # read the parts inside it directly -- same gate, same limit. They
             # carry no keyword match; the caller must accept that explicitly.
-            rows = conn.execute(
+            window_rows = conn.execute(
                 "SELECT a.*,p.name project_name,0.0 AS rank FROM conversation_parts a "
                 "JOIN projects p ON p.project_id=a.project_id WHERE " + gate +
                 " AND a.captured_at BETWEEN ? AND ? "
                 "ORDER BY a.captured_at DESC,a.archive_id LIMIT ?",
                 [*args, time_window[0], time_window[1], limit]).fetchall()
-            basis = "time_window"
+            window_ids = {r["archive_id"] for r in window_rows}
+            rows = [*window_rows, *(r for r in rows if r["archive_id"] not in window_ids)][:limit]
         def excerpt(row):
             text = row["text"]
             matches = [term for term in terms if term in text.lower()]
             positions = [text.lower().find(term) for term in matches]
             start = max(0, min(positions) - 100) if positions else 0
             return text[start:start + 600], matches
-        return {"query_terms": terms, "items": [{"kind": "conversation_reference", "retrieval_basis": basis,
+        return {"query_terms": terms, "items": [{"kind": "conversation_reference",
+            "retrieval_basis": "time_window" if r["archive_id"] in window_ids else "fts",
             "archive_id": r["archive_id"],
             "session_id": r["session_id"], "message_id": r["message_id"], "role": r["role"],
             "source_app": r["app"], "source_client_id": r["client_id"], "project_id": r["project_id"], "project_name": r["project_name"],

@@ -71,7 +71,7 @@ _DATE_TIME_CUE = re.compile(
 # Deictic words ("当时"/"上次"/"刚才") point *at* the recent turns and must
 # keep using them; only anchors that recent turns cannot supply count here.
 _PROVENANCE_CUE = re.compile(
-    r"谁[在来]?(?:改|写|动|做)|哪次|什么时候|几点|为什么改|怎么改的?|哪个客户端|"
+    r"谁[在来]?(?:改|写|动|做|删|加|修|建|弄|提)|哪次|什么时候|几点|为什么改|怎么改的?|哪个客户端|"
     r"来源|出自|昨晚|那天|昨天|前天|今天|今晚", re.I)
 # Only clients the archive actually records; display names are not app values.
 _APP_CUE = {"workbuddy": re.compile(r"(?<![A-Za-z])workbuddy(?![A-Za-z])", re.I),
