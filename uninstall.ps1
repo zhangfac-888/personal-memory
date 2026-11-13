@@ -71,7 +71,23 @@ try {
         if ((Test-Path -LiteralPath $python -PathType Leaf) -and (Test-Path -LiteralPath $automation)) {
             foreach ($folder in Get-ChildItem -LiteralPath $automation -Directory -ErrorAction SilentlyContinue) {
                 $config = Read-Json (Join-Path $folder.FullName 'config.json')
-                if ($null -eq $config) { continue }
+                if ($null -eq $config) {
+                    # Read-only MCP connections keep no automation config, and this
+                    # package has no verified way to remove their client entry.
+                    # Report it instead of silently leaving it behind.
+                    $mcp = Read-Json (Join-Path $folder.FullName 'mcp.json')
+                    if ($null -ne $mcp) {
+                        $mcpMarker = [string]$mcp.data_marker
+                        if ($mcpMarker -and (Same-Path (Split-Path -Parent $mcpMarker) $data)) {
+                            $mcpTarget = [string]$mcp.target
+                            $report.clients[$folder.Name] = 'mcp_entry_left'
+                            $report.warnings += ('client ' + $folder.Name + ': read-only MCP entry left in ' + $mcpTarget)
+                            Say ("  $($folder.Name): read-only MCP entry was left in " + $mcpTarget)
+                            Say '    remove the personal_memory entry from that file if you no longer want it'
+                        }
+                    }
+                    continue
+                }
                 $marker = [string]$config.data_marker
                 if (-not $marker -or -not (Same-Path (Split-Path -Parent $marker) $data)) { continue }
                 $output = ''

@@ -179,6 +179,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1 -Yes
 - 只停止命令行确实指向这个安装的进程；不认识的监听进程不动。
 - 只删除参数完全匹配的计划任务。
 - 默认先反注册指向这个安装的客户端，避免 Claude hooks 还指向已删除的 python.exe。
+- **只读 MCP 客户端不会被自动移除**：这类连接没有自动适配器配置，本包也没有经过验证的删除路径。卸载时会列出 `mcp_entry_left` 和目标文件，需要用户在对应文件里手动删掉 `personal_memory` 条目（环境变量里的旧令牌也可以一并删除）。
 - **数据默认保留**；要删库必须显式 `-RemoveData`，并且会再问一次。
 - 解压目录/仓库目录永远不动。
 
