@@ -7,7 +7,8 @@
 你可以：
 - 读取本文件、检查环境、运行 `install.ps1` / `verify.ps1` / `uninstall.ps1`。
 - 在本机安装、启动、停止这个服务，读取它自己写出的日志和 JSON 结果。
-- 在用户明确同意后，用 `-Connect` 把**指定的**一个客户端接上。
+- 在用户明确同意后，用 `-Connect` 把**指定的**一个客户端接上（只读检索）。
+- 在用户明确同意后，用 `-Capture` 给**指定的**一个客户端开启自动采集（会写钩子）。
 
 你不能：
 - 让用户把 DeepSeek API key、管理密钥（`admin-key.txt` 的内容）粘贴到聊天里。
@@ -70,10 +71,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Yes
 成功时最后一行是：
 
 ```
-PM_RESULT {"status":"installed","app":"...","data":"...","port":8765,"snapshot":"...","service":"running","startup_task":"configured","connected":{},"warnings":[]}
+PM_RESULT {"status":"installed","app":"...","data":"...","port":8765,"snapshot":"...","service":"running","startup_task":"configured","connected":{},"capture":{},"warnings":[]}
 ```
 
-退出码：`0` 成功；`1` 失败（看 `error` 字段）；`2` 安装成功但有客户端没接上（看 `connected`）。
+退出码：`0` 成功；`1` 失败（看 `error` 字段）；`2` 安装成功但有客户端没接上或没开成采集（看 `connected` / `capture`）。
 
 失败时保留原始错误，不要反复重试超过两次；先按第 10 节判断原因。
 
@@ -122,6 +123,38 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Yes -Connect 
 - “配置成功”不等于“客户端原生聊天已实际用上记忆”。在用户真实提问并看到检索/采集结果前，只能报“已配置，待原生验证”。
 - 客户端连接失败不会影响安装本身；退出码为 `2`，`connected` 里会写明哪个失败。
 
+### 6.1 可选：开启自动采集（`-Capture`，默认关闭）
+
+`-Connect` 只给只读检索：客户端能主动查，不会自动记录。要让某个客户端**每轮自动把对话片段记进本机库**，单独开：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Yes -Capture codex
+```
+
+可用值：`codex`、`workbuddy`、`opencode`，可逗号分隔（如 `-Capture codex,workbuddy`）。**Claude 不在这个列表里**：`-Connect claude` 本身就会装 hooks + 只读 MCP，已经包含采集。
+
+它会做什么（执行前必须原样告诉用户）：
+
+- 往该客户端自己的配置里写入一组钩子：Codex `~/.codex/hooks.json`、WorkBuddy `~/.workbuddy/settings.json`、OpenCode `~/.config/opencode/plugins/personal-memory-automatic.js`（必要时先留一份 `.bak`）。
+- 在服务里登记一个自动化客户端，令牌写进当前用户的 Windows 环境变量，不写进客户端配置文件。
+- 每轮结束时把用户原话和助手结果提交到本机数据库。
+- 还没有任务合约时，钩子可能**拒绝写文件、执行命令**这类工具操作。这是设计内的保护，不是安装故障，但会打断用户当时的工作。
+- 如果用户之后配了 DeepSeek key，被选中的文本可能会发送给 DeepSeek 做提炼。
+- 装完必须让用户重启客户端，并确认该客户端自己的钩子信任提示。
+
+想要“能查 + 自动记”，两个开关都要给，例如：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Yes -Connect codex -Capture codex
+```
+
+结果与撤销：
+
+- `PM_RESULT.capture` 里每个客户端是 `configured` / `failed` / `skipped_other_installation`。只要不是 `configured`，退出码就是 `2`（安装本身仍是成功的）。
+- 如果该客户端以前卸载过、留下一个**暂停的**采集记录，`-Capture` 会写成 `failed`：钩子写进去了，但产品会把那条旧记录保持停用。这时不要在聊天里猜，告诉用户到 `http://127.0.0.1:<端口>/` 把那个客户端重新启用，或者先移除旧记录再跑一次 `-Capture`。
+- 撤销单个客户端：用该安装自己的 Python 和环境变量运行 `App\connect-agent\scripts\connect_agent.py disable --host codex`；`uninstall.ps1` 默认也会反注册指向本安装的客户端。
+- 如果这个客户端已经连着**另一个** Personal Memory 安装，脚本输出 `skipped_other_installation` 并跳过，不改那个客户端；先卸载旧安装。
+
 ## 7. 可选：配置 DeepSeek key（只能由人输入）
 
 没有 key 时：网页、手动记录、关键词检索仍可用；自动/手动 AI 提炼关闭，事件会保留并明确报错。
@@ -146,12 +179,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Yes -Connect 
 
 ## 9. 向用户汇报什么
 
-按这四项分开说，不要合并：
+按这五项分开说，不要合并：
 
 1. **安装与校验**：`PM_RESULT` / `PM_VERIFY` 的结论、退出码、安装路径和端口。
 2. **能力状态**：只有关键词检索 / 已配 key；语义检索是否就绪（Ollama+BGE-M3）。
 3. **客户端**：连了哪个、改了什么、是否需要重启、哪些还没在原生聊天里验证。
-4. **未做/未验证**：例如“没开自动采集”“没在另一台机器验证”“没观察模型是否采用了注入内容”。
+4. **自动采集**：哪些客户端开了 `-Capture`（`capture` 字段的结果）、哪些仍是只读、是否需要重启和钩子信任。
+5. **未做/未验证**：例如“没开自动采集”“没在另一台机器验证”“没观察模型是否采用了注入内容”。
 
 管理密钥在 `%LOCALAPPDATA%\PersonalMemoryShare\Data\admin-key.txt`，让用户自己打开并只粘贴到本地登录页。
 
@@ -165,6 +199,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Yes -Connect 
 | 下载失败 / `uv checksum mismatch` | 网络或镜像问题。重试一次；校验不通过时脚本不会执行下载的二进制。 |
 | `Service not ready` | 看 `Data\server.stderr.log` 和 `server.stdout.log`。常见原因是依赖没装全或端口刚刚被抢。 |
 | `Different existing installation` | 这个目录已经装过别的 snapshot。让用户先运行 `uninstall.ps1`，再做新安装；不要手工删身份文件。 |
+| `-Capture` 结果为 `failed` | 采集没开成，安装本身没受影响。看 `PM_RESULT.capture` 的错误摘要；确认那个客户端的配置文件可写、没被另一个安装占用。不要手工把两套钩子并进同一个文件。 |
 | 网页登录失败 | 让用户重新打开 `admin-key.txt`；不要把 key 发到聊天里。 |
 | 语义检索不工作 | 检查 Ollama 是否运行、`bge-m3:latest` 是否存在、摘要是否匹配。 |
 
@@ -189,6 +224,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1 -Yes
 
 - 这是 Windows x64 预览包。本机安装成功不等于在所有环境一键成功。
 - 安装不等于客户端原生闭环：MCP 能被发现、hooks 能触发、记忆能检索，都需要在用户真实使用中分别观察。
-- 自动采集默认关闭；Claude 连接是唯一会启用采集的选项，且需要用户明确同意。
+- 自动采集默认关闭。只有两种方式会打开它：`-Connect claude`（hooks + 只读 MCP）或显式 `-Capture <client>`；两者都需要用户明确同意，且都可能触发 DeepSeek 提炼。
 - 代码回归数、历史基准成绩不是本安装包的质量证明，也不代表回答准确率。
 - 不要把这套说明改写成“永不出本机”：开启 DeepSeek 提炼后，选中文本会发到 DeepSeek。

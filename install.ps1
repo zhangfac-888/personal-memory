@@ -6,6 +6,7 @@ param(
   [switch]$NoStartup,
   [switch]$NoBrowser,
   [string]$Connect = '',
+  [string]$Capture = '',
   [switch]$Json
 )
 $ErrorActionPreference = 'Stop'
@@ -18,7 +19,7 @@ $port = $Port
 $manifestPath = Join-Path $source 'package-manifest.json'
 $uvVersion = '0.13.7'
 $uvHash = '0cdc5b38fe5a8168ed6a25814f5ba43c21d313dd3187314fccb37b7cec46e021'
-$result = @{ status = 'not_started'; app = $app; data = $data; port = $port; snapshot = $null; service = 'unknown'; schema = $null; startup_task = 'unknown'; connected = @{}; warnings = @() }
+$result = @{ status = 'not_started'; app = $app; data = $data; port = $port; snapshot = $null; service = 'unknown'; schema = $null; startup_task = 'unknown'; connected = @{}; capture = @{}; warnings = @() }
 
 function Say([string]$text) { if (-not $Json) { Write-Host $text } }
 function Note([string]$text) { if (-not $Json) { Write-Host $text } else { $script:result.warnings += $text } }
@@ -28,6 +29,16 @@ function Write-Result {
 function Same-Path([string]$left, [string]$right) {
   if (-not $left -or -not $right) { return $false }
   return ([IO.Path]::GetFullPath($left).TrimEnd('\') -eq [IO.Path]::GetFullPath($right).TrimEnd('\'))
+}
+function Test-ForeignBinding([string]$client) {
+    # True when this client's automation record belongs to another installation.
+    $existingConfig = Join-Path $env:USERPROFILE ('.personal-memory\automation\' + $client + '\config.json')
+    if (-not (Test-Path -LiteralPath $existingConfig -PathType Leaf)) { return $false }
+    $existing = Get-Content -LiteralPath $existingConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+    $marker = [string]$existing.data_marker
+    if ($marker) { return (-not (Same-Path (Split-Path -Parent $marker) $script:data)) }
+    if ($existing.base_url) { return ([string]$existing.base_url -ne ("http://127.0.0.1:" + $script:port)) }
+    return $false
 }
 function Confirm-Yes([string]$question) {
   if ($Yes) { return $true }
@@ -92,22 +103,11 @@ function Invoke-Connections([string]$spec) {
     foreach ($client in $wanted) {
         # Never redirect an existing client that already belongs to another
         # installation on this machine: its config, token and hooks must stay put.
-        $existingConfig = Join-Path $env:USERPROFILE ('.personal-memory\automation\' + $client + '\config.json')
-        if (Test-Path -LiteralPath $existingConfig -PathType Leaf) {
-            $existing = Get-Content -LiteralPath $existingConfig -Raw -Encoding UTF8 | ConvertFrom-Json
-            $marker = [string]$existing.data_marker
-            $foreign = $false
-            if ($marker) {
-                $foreign = -not (Same-Path (Split-Path -Parent $marker) $data)
-            } elseif ($existing.base_url) {
-                $foreign = ([string]$existing.base_url -ne "http://127.0.0.1:$port")
-            }
-            if ($foreign) {
-                $script:result.connected[$client] = 'skipped_other_installation'
-                Say "  $client is already connected to a different Personal Memory installation."
-                Say '  Uninstall that installation first; nothing was changed.'
-                continue
-            }
+        if (Test-ForeignBinding $client) {
+            $script:result.connected[$client] = 'skipped_other_installation'
+            Say "  $client is already connected to a different Personal Memory installation."
+            Say '  Uninstall that installation first; nothing was changed.'
+            continue
         }
         Say ("Connecting $client ...")
         if ($client -eq 'claude') {
@@ -144,6 +144,64 @@ function Invoke-Connections([string]$spec) {
     }
 }
 
+function Invoke-Capture([string]$spec) {
+    $allowed = @('codex', 'workbuddy', 'opencode')
+    $wanted = @($spec.Split(',') | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+    foreach ($client in $wanted) {
+        if ($allowed -notcontains $client) { throw "Unsupported -Capture value: $client" }
+    }
+    $python = Join-Path $app '.venv\Scripts\python.exe'
+    $env:PERSONAL_MEMORY_DATA = $data
+    $env:PERSONAL_MEMORY_BASE = "http://127.0.0.1:$port"
+    foreach ($client in $wanted) {
+        if (Test-ForeignBinding $client) {
+            $script:result.capture[$client] = 'skipped_other_installation'
+            Say "  $client already has automation settings from a different Personal Memory installation."
+            Say '  Nothing was changed there; uninstall that installation first.'
+            continue
+        }
+        Say ("Enabling automatic capture for " + $client + ' ...')
+        Say '  This writes hooks or a plugin into that client, stores each turn in the local library,'
+        Say '  can deny tool actions before task contracts exist, and needs a client restart plus that'
+        Say "  client's own hook trust. With a DeepSeek key configured, selected text may be sent there."
+        $entry = Join-Path $app 'connect-agent\scripts\connect_agent.py'
+        $output = ''
+        $code = 1
+        try {
+            $output = (& $python -B $entry install --host $client 2>&1 | Out-String)
+            $code = $LASTEXITCODE
+        } catch {
+            $output = $_.Exception.Message
+            $code = 1
+        }
+        if ($code -eq 0) {
+            # An earlier uninstall keeps its adapter record paused. The installer
+            # re-adds hooks for that record but the product keeps it disabled, so
+            # report that instead of claiming capture is on.
+            $record = Join-Path $env:USERPROFILE ('.personal-memory\automation\' + $client + '\config.json')
+            $paused = $false
+            if (Test-Path -LiteralPath $record -PathType Leaf) {
+                $state = Get-Content -LiteralPath $record -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($null -ne $state.enabled -and -not $state.enabled) { $paused = $true }
+            }
+            if ($paused) {
+                $script:result.capture[$client] = 'failed'
+                Say "  $client has an earlier capture record that is still paused; hooks were written but capture stays off."
+                Say ('  Turn that client back on in http://127.0.0.1:' + $port + '/ or remove the old record, then run -Capture again.')
+            } else {
+                $script:result.capture[$client] = 'configured'
+                Say "  $client capture configured. Restart it and approve that client's hook trust prompt."
+            }
+        } else {
+            $script:result.capture[$client] = 'failed'
+            $message = ($output -replace '\s+', ' ').Trim()
+            if ($message.Length -gt 400) { $message = $message.Substring(0, 400) }
+            Say "  $client capture was not enabled: $message"
+            Say '  Installation itself is complete; nothing else was changed.'
+        }
+    }
+}
+
 try {
     if (-not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { throw 'This preview supports Windows x64 only.' }
     if ($port -lt 1024 -or $port -gt 65535) { throw 'Choose a port between 1024 and 65535.' }
@@ -151,6 +209,12 @@ try {
     if ($Connect) {
         foreach ($client in @($Connect.Split(',') | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })) {
             if (@('claude', 'codex', 'workbuddy', 'opencode') -notcontains $client) { throw "Unsupported -Connect value: $client" }
+        }
+    }
+    if ($Capture) {
+        foreach ($client in @($Capture.Split(',') | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })) {
+            if ($client -eq 'claude') { throw 'Claude capture is enabled through -Connect claude, not -Capture.' }
+            if (@('codex', 'workbuddy', 'opencode') -notcontains $client) { throw "Unsupported -Capture value: $client" }
         }
     }
     $manifest = Check-Package
@@ -206,10 +270,10 @@ try {
         Say 'Already installed and running; data preserved.'
         $result.status = 'already_installed'
         $result.service = 'running'
-        if ($Connect) {
-            Invoke-Connections $Connect
-            if (@($result.connected.Values | Where-Object { $_ -ne 'configured' }).Count -gt 0) { $result.status = 'already_installed_connect_incomplete'; Write-Result; exit 2 }
-        }
+        if ($Connect) { Invoke-Connections $Connect }
+        if ($Capture) { Invoke-Capture $Capture }
+        $incomplete = @($result.connected.Values | Where-Object { $_ -ne 'configured' }).Count + @($result.capture.Values | Where-Object { $_ -ne 'configured' }).Count
+        if ($incomplete -gt 0) { $result.status = 'already_installed_connect_incomplete'; Write-Result; exit 2 }
         Write-Result
         if (-not $NoBrowser) { Start-Process "http://127.0.0.1:$port/" }
         exit 0
@@ -305,6 +369,7 @@ try {
     Say 'Keyword search is ready. Semantic search needs a separately installed Ollama/BGE-M3.'
     Say 'Connect-Agents.cmd is optional. It changes only the client you select, after confirmation.'
     if ($Connect) { Invoke-Connections $Connect }
+    if ($Capture) { Invoke-Capture $Capture }
     if ($NoBrowser) {
         Say 'Browser was not opened (-NoBrowser).'
     } elseif ($Yes) {
@@ -316,7 +381,8 @@ try {
         Say 'Management key copied. Paste it only into the local PM login page; clear clipboard afterwards.'
     } else { Say "Open the local file $data\admin-key.txt to obtain your management key. Do not share it." }
     $result.status = 'installed'
-    if ($Connect -and (@($result.connected.Values | Where-Object { $_ -ne 'configured' }).Count -gt 0)) { $result.status = 'installed_connect_incomplete' }
+    $incomplete = @($result.connected.Values | Where-Object { $_ -ne 'configured' }).Count + @($result.capture.Values | Where-Object { $_ -ne 'configured' }).Count
+    if ($incomplete -gt 0) { $result.status = 'installed_connect_incomplete' }
     Write-Result
     if (-not $NoBrowser) { Start-Process "http://127.0.0.1:$port/" }
     if ($result.status -eq 'installed_connect_incomplete') { exit 2 }
