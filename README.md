@@ -12,6 +12,8 @@
 
 不需要提前装 Python、uv 或 Node，也不用手动输入命令。首次需联网下载官方运行环境和锁定依赖；网络失败时会停止并显示错误。
 
+**交给 AI 安装：** 把这个仓库链接和 [install.md](install.md) 一起给对方的 AI；里面有预检、无人值守安装、只读校验 `verify.ps1`、可选客户端连接和卸载 `uninstall.ps1`。安装脚本不会跨 snapshot 覆盖：之前装过旧 snapshot 的，先用本包的 `uninstall.ps1` 卸载（数据默认保留），再安装。
+
 安装后自动打开 **http://127.0.0.1:8765/**。选择复制本地管理密钥后，粘贴到登录框即可；密钥不要发给别人。登录后清空剪贴板。
 
 - 软件：`%LOCALAPPDATA%\PersonalMemoryShare\App`
