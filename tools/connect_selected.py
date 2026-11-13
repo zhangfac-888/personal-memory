@@ -1,11 +1,31 @@
 """Connect only the client explicitly chosen by this machine's owner."""
 from pathlib import Path
+import json
 import os
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'connect-agent/scripts'))
 sys.path.insert(0, str(ROOT))
+
+
+def existing_binding(data, base, host):
+    """Refuse when this client's automation config belongs to another installation."""
+    record_path = Path.home() / '.personal-memory' / 'automation' / host / 'config.json'
+    if not record_path.is_file():
+        return None
+    try:
+        record = json.loads(record_path.read_text('utf-8-sig'))
+    except (OSError, ValueError):
+        return 'its existing automation config cannot be read'
+    marker = record.get('data_marker')
+    if marker:
+        owned = Path(str(marker)).parent.resolve()
+        if owned != data.resolve():
+            return 'it is already connected to another Personal Memory installation'
+    elif record.get('base_url') and record.get('base_url') != base:
+        return 'it is already connected to another Personal Memory installation'
+    return None
 
 
 def main():
@@ -20,6 +40,13 @@ def main():
         return 1
     data = Path(os.environ['PERSONAL_MEMORY_DATA'])
     base = os.environ.get('PERSONAL_MEMORY_BASE', 'http://127.0.0.1:8765')
+    host = 'claude' if selected == '4' else {'1': 'codex', '2': 'workbuddy', '3': 'opencode'}[selected]
+    reason = existing_binding(data, base, host)
+    if reason:
+        print(host + ' was not changed: ' + reason + '.')
+        print('Uninstall that installation first, or connect this installation with install.ps1 -Connect.')
+        print('No client setting, token or hook was modified.')
+        return 2
     if selected == '4':
         print('Claude capture stores conversation parts locally; configured extraction can send text to DeepSeek.')
         print('Task-enforcement hooks can deny actions until project grants and stage contracts are configured.')
@@ -29,7 +56,6 @@ def main():
         import connect_claude
         result = connect_claude.install()
     else:
-        host = {'1': 'codex', '2': 'workbuddy', '3': 'opencode'}[selected]
         print('Read-only MCP searches all authorized non-excluded active projects; it does not enable capture or direct Active writes.')
         if input('Change settings for ' + host + '? Type YES: ') != 'YES':
             return 0

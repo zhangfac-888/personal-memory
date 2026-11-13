@@ -115,6 +115,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Yes -Connect 
 
 如果这台机器上已经有**另一个** Personal Memory 安装连着同一个客户端，脚本会输出 `skipped_other_installation` 并拒绝改动；必须先卸载那个安装。不要手工改它的配置或环境变量来绕过。
 
+`Connect-Agents.cmd` 是同一件事的交互入口，但只认默认安装位置（`%LOCALAPPDATA%\PersonalMemoryShare`）；用 `-Root` 装的人请用上面的 `-Connect`。它同样会先检查客户端是否已连别的安装，若已连则输出 `already connected to another Personal Memory installation`、退出码 `2`，不改任何客户端设置。
+
 连接后：
 - 必须让用户重启或重新加载对应客户端，并确认客户端自己的信任/工具提示。
 - “配置成功”不等于“客户端原生聊天已实际用上记忆”。在用户真实提问并看到检索/采集结果前，只能报“已配置，待原生验证”。
