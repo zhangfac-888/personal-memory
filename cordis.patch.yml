@@ -1,0 +1,11 @@
+- insert:
+    - id: personal-memory-market-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: personal_memory_market
+        transport: streamable-http
+        url: http://127.0.0.1:8765/mcp/
+        headers:
+          Authorization: !!js '`Bearer ${process.env.PERSONAL_MEMORY_MCP_DSH_TOKEN || process.env.PERSONAL_MEMORY_DSH_TOKEN || ""}`'
+        toolCallTimeoutMs: 30000
+        failOnStartupError: false
