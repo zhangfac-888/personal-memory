@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "个人记忆 MCP",
+    "description": "把 DeepSeek Harness 连接到本机 Personal Memory 服务的 http://127.0.0.1:8765/mcp/ 接口。使用 PERSONAL_MEMORY_MCP_DSH_TOKEN（或 PERSONAL_MEMORY_DSH_TOKEN）中的只读客户端令牌；缺少令牌时不会添加任何工具。请先安装并启动 Personal Memory，再重启 DSH 以继承该令牌。"
+  }
+}
