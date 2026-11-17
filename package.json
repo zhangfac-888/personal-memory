@@ -4,11 +4,18 @@
   "description": "Connects DeepSeek Harness to a locally installed Personal Memory service through its MCP endpoint.",
   "private": true,
   "type": "module",
+  "main": "./index.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zhangfac-888/personal-memory.git"
+  },
   "exports": {
+    ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
+    "index.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg"
