@@ -1,6 +1,6 @@
 {
   "name": "@zhangfac-888/personal-memory-dsh",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Connects DeepSeek Harness to a locally installed Personal Memory service through its MCP endpoint.",
   "private": true,
   "type": "module",
@@ -18,6 +18,7 @@
     "index.js",
     "cordis.patch.yml",
     "locale/*.json",
+    "docs",
     "icon.svg"
   ],
   "dsh": {
