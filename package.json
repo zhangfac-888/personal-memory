@@ -1,9 +1,12 @@
 {
   "name": "@zhangfac-888/personal-memory-dsh",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Connects DeepSeek Harness to a locally installed Personal Memory service through its MCP endpoint.",
   "private": true,
   "type": "module",
+  "engines": {
+    "dsh": ">=0.2.2-rc.5 <0.3.0-0"
+  },
   "main": "./index.js",
   "repository": {
     "type": "git",
