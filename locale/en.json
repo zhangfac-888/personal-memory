@@ -1,6 +1,7 @@
 {
   "meta": {
     "title": "Personal Memory MCP",
-    "description": "Connects DeepSeek Harness to a local Personal Memory service at http://127.0.0.1:8765/mcp/. Uses a read-only client token from PERSONAL_MEMORY_MCP_DSH_TOKEN (or PERSONAL_MEMORY_DSH_TOKEN); no tools are added when the token is missing. Install and start Personal Memory first, then restart DSH so it inherits the token."
+    "description": "Lets DSH agents search and read a local Personal Memory library: saved memories, their sources, and task checkpoints. Requires Personal Memory running on the same Windows machine plus a read-only client token; writes are rejected and candidate memories still need local approval.",
+    "detail": "docs/DETAIL.md"
   }
 }
