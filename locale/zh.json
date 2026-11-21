@@ -1,7 +1,6 @@
 {
   "meta": {
     "title": "个人记忆 MCP",
-    "description": "让 DSH 智能体检索并读取本机 Personal Memory 记忆库：已保存记忆、来源页和任务检查点。需在同一台 Windows 电脑上运行 Personal Memory，并创建只读客户端令牌；写入会被拒绝，候选记忆仍需本地审核。",
-    "detail": "docs/DETAIL.zh.md"
+    "description": "让 DSH 智能体检索并读取本机 Personal Memory 记忆库：已保存记忆、来源页和任务检查点。需在同一台 Windows 电脑上运行 Personal Memory，并创建只读客户端令牌；写入会被拒绝，候选记忆仍需本地审核。"
   }
 }
