@@ -1,7 +1,6 @@
 {
   "meta": {
     "title": "Personal Memory MCP",
-    "description": "Lets DSH agents search and read a local Personal Memory library: saved memories, their sources, and task checkpoints. Requires Personal Memory running on the same Windows machine plus a read-only client token; writes are rejected and candidate memories still need local approval.",
-    "detail": "docs/DETAIL.md"
+    "description": "Lets DSH agents search and read a local Personal Memory library: saved memories, their sources, and task checkpoints. Requires Personal Memory running on the same Windows machine plus a read-only client token; writes are rejected and candidate memories still need local approval."
   }
 }
